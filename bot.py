@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     phone           TEXT,
     status          TEXT    DEFAULT 'pending',
     channel_post_id INTEGER DEFAULT 0,
+    reason          TEXT    DEFAULT '',
     created_at      TEXT    DEFAULT (datetime('now')),
     resolved_at     TEXT
 );
@@ -150,7 +151,7 @@ class DataEngine:
     async def add_balance(user_id: int, amount: float):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id)
+                "UPDATE users SET balance = ROUND(balance + ?, 2) WHERE user_id = ?", (amount, user_id)
             )
             await db.commit()
 
@@ -209,11 +210,11 @@ class DataEngine:
             return await cur.fetchone()
 
     @staticmethod
-    async def update_withdrawal_status(wid: int, status: str, post_id: int = 0):
+    async def update_withdrawal_status(wid: int, status: str, post_id: int = 0, reason: str = ""):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "UPDATE withdrawals SET status=?, channel_post_id=?, resolved_at=datetime('now') WHERE id=?",
-                (status, post_id, wid),
+                "UPDATE withdrawals SET status=?, channel_post_id=?, reason=?, resolved_at=datetime('now') WHERE id=?",
+                (status, post_id, reason, wid),
             )
             await db.commit()
 
@@ -275,25 +276,25 @@ class AdminConsoleWorkflow(StatesGroup):
     direct_balance_target_id = State()
     direct_balance_volume    = State()
     broadcast_intel_payload  = State()
+    broadcast_confirmation   = State()
     lookup_individual_id     = State()
     banish_individual_id     = State()
     pardon_individual_id     = State()
+    write_reject_reason      = State()
 
 bot         = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp          = Dispatcher(storage=MemoryStorage())
 core_router = Router()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FORCE JOIN LOGIC (የተስተካከለ - በየመካከሉ fake እንዳይመጣ)
+# FORCE JOIN LOGIC (የተስተካከለ - Fake ቻናልን ቼክ አያደርግም)
 # ─────────────────────────────────────────────────────────────────────────────
 async def inspect_compulsory_memberships(user_id: int) -> list:
     channels = await DataEngine.get_force_channels()
     unjoined = []
     for ch in channels:
-        # 🟡 ፌክ ቻናል ከሆነ በየመካከሉ ዳሽቦርድ ላይ ሙሉ በሙሉ ይታለፋል (Skip)
-        if ch["bot_added"] == 1:
+        if ch["bot_added"] == 1: # ማስመሰያ/Fake ከሆነ ቼክ አያደርግም፣ ይዘለላል
             continue
-        # 🔴 እውነተኛ ቻናል ከሆነ ብቻ ቦቱ አድሚን መሆኑን ያረጋግጣል (with admin)
         try:
             m = await bot.get_chat_member(chat_id=ch["channel_id"], user_id=user_id)
             if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, ChatMemberStatus.RESTRICTED):
@@ -303,17 +304,15 @@ async def inspect_compulsory_memberships(user_id: int) -> list:
     return unjoined
 
 async def enforce_membership_gate(event, user_id: int) -> bool:
-    # 1. መጀመሪያ እውነተኛዎቹን ቻናሎች ቼክ እናደርጋለን
     unjoined = await inspect_compulsory_memberships(user_id)
     
-    # 2. ለመጀመሪያ ጊዜ መግቢያ ላይ ብቻ ከሆነ ፌክ ቻናሎችንም በሊስቱ ውስጥ እናካትታለን
     is_callback = isinstance(event, CallbackQuery)
     current_data = event.data if is_callback else ""
     
     if not is_callback or current_data in ("ui_return_home", ""):
         all_channels = await DataEngine.get_force_channels()
         for ch in all_channels:
-            if ch["bot_added"] == 1:
+            if ch["bot_added"] == 1: # አዲስ ሰው ለመጀመሪያ ጊዜ ሲመጣ ሊንኩ ብቻ እንዲታይ ይደረጋል
                 if not any(x['channel_id'] == ch['channel_id'] for x in unjoined):
                     unjoined.append(dict(ch))
 
@@ -324,8 +323,9 @@ async def enforce_membership_gate(event, user_id: int) -> bool:
     for ch in unjoined:
         buttons.append([InlineKeyboardButton(text=f"➕ Join: {ch['channel_name']}", url=ch["invite_link"])])
 
-    buttons.append([InlineKeyboardButton(text="✅ Joined — Verify Status", callback_data="ui_revalidate_channels")])
-    txt = "⚠️ <b>Action Required:</b> Please join our mandatory channel(s) to continue / እባክዎ ቻናላችንን ይቀላቀሉ:"
+    buttons.append([InlineKeyboardButton(text="✅ Joined / ተቀላቅያለሁ", callback_data="ui_revalidate_channels")])
+    
+    txt = "👋 <b>Welcome!</b>\n\nእባክዎ ከታች ያሉትን ሁሉንም ቻናሎች ይቀላቀሉ፣ ከዚያም <b>'Joined'</b> የሚለውን በተን ይጫኑ።\n\nPlease join all channels and continue."
     
     if isinstance(event, Message):
         await event.answer(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
@@ -333,6 +333,37 @@ async def enforce_membership_gate(event, user_id: int) -> bool:
         await event.message.answer(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
         await event.answer()
     return False
+
+@core_router.callback_query(F.data == "ui_revalidate_channels")
+async def process_channel_revalidation(callback: CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    channels = await DataEngine.get_force_channels()
+    
+    real_unjoined = []
+    for ch in channels:
+        if ch["bot_added"] == 0: # እውነተኛ የሆኑትን ብቻ ዳግም ያረጋግጣል
+            try:
+                m = await bot.get_chat_member(chat_id=ch["channel_id"], user_id=uid)
+                if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, ChatMemberStatus.RESTRICTED):
+                    real_unjoined.append(ch)
+            except Exception:
+                real_unjoined.append(ch)
+                
+    if real_unjoined:
+        return await callback.answer("❌ Please join all channels and continue.", show_alert=True)
+    
+    try: await callback.message.delete()
+    except Exception: pass
+    
+    s = await state.get_data()
+    ref = s.get("stashed_referrer_id", 0)
+    await state.clear()
+
+    if await DataEngine.is_verified(uid):
+        await callback.message.answer("✅ Identity clear!", reply_markup=generate_dashboard_matrix(uid))
+    else:
+        sent = await callback.message.answer(f"{BOT_RULES_CAPTION}\n\n🔐 <b>Attestation Step:</b> Launch Mini App verification:", reply_markup=generate_verification_widget(uid, ref, 0))
+        await sent.edit_reply_markup(reply_markup=generate_verification_widget(uid, ref, sent.message_id))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -374,7 +405,7 @@ def generate_dashboard_matrix(user_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="👥 Referrals / ጋባዦች", callback_data="ui_fetch_referrals"),
         ],
         [
-            InlineKeyboardButton(text="🔗 My Link / ሊንኬ",         callback_data="ui_fetch_link"),
+            InlineKeyboardButton(text="🚀 Invite Now / አሁኑኑ ይጋብዙ", callback_data="ui_fetch_link"),
             InlineKeyboardButton(text="💸 Withdraw / ብር ማውጫ", callback_data="ui_initiate_withdrawal"),
         ],
     ]
@@ -423,38 +454,6 @@ async def process_start_command(message: Message, state: FSMContext):
     sent = await message.answer(f"{BOT_RULES_CAPTION}\n\n🔐 <b>Next Step:</b> Verify identity via Mini App:", reply_markup=generate_verification_widget(uid, ref, 0))
     await sent.edit_reply_markup(reply_markup=generate_verification_widget(uid, ref, sent.message_id))
 
-# 🔴 እውነተኛ ቻናሎችን ብቻ ቼክ የሚያደርግ (with admin)
-@core_router.callback_query(F.data == "ui_revalidate_channels")
-async def process_channel_revalidation(callback: CallbackQuery, state: FSMContext):
-    uid = callback.from_user.id
-    channels = await DataEngine.get_force_channels()
-    
-    real_unjoined = []
-    for ch in channels:
-        if ch["bot_added"] == 0:  # እውነተኛ ብቻ ቴሌግራም ላይ ቼክ ይደረጋል
-            try:
-                m = await bot.get_chat_member(chat_id=ch["channel_id"], user_id=uid)
-                if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, ChatMemberStatus.RESTRICTED):
-                    real_unjoined.append(ch)
-            except Exception:
-                real_unjoined.append(ch)
-                
-    if real_unjoined:
-        return await callback.answer("❌ Verification failed. Please join all the assigned channels first.", show_alert=True)
-    
-    try: await callback.message.delete()
-    except Exception: pass
-    
-    s = await state.get_data()
-    ref = s.get("stashed_referrer_id", 0)
-    await state.clear()
-
-    if await DataEngine.is_verified(uid):
-        await callback.message.answer("✅ Identity clear!", reply_markup=generate_dashboard_matrix(uid))
-    else:
-        sent = await callback.message.answer(f"{BOT_RULES_CAPTION}\n\n🔐 <b>Attestation Step:</b> Launch Mini App verification:", reply_markup=generate_verification_widget(uid, ref, 0))
-        await sent.edit_reply_markup(reply_markup=generate_verification_widget(uid, ref, sent.message_id))
-
 @core_router.callback_query(F.data == "ui_return_home")
 async def process_navigation_home(callback: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -466,7 +465,7 @@ async def process_balance_query(callback: CallbackQuery):
     if not await enforce_membership_gate(callback, callback.from_user.id): return
     acc   = await DataEngine.get_user(callback.from_user.id)
     min_w = await DataEngine.get_setting("min_withdrawal", "50")
-    await callback.message.edit_text(f"💰 <b>Your Available Balance:</b>\n\n• Assets: <code>{acc['balance']:.2f} Birr</code>\n• Minimum Withdrawal: <code>{min_w} Birr</code>", reply_markup=generate_fallback_navigation())
+    await callback.message.edit_text(f"💰 <b>Your Available Balance:</b>\n\n• Assets: <code>{float(acc['balance']):.2f} Birr</code>\n• Minimum Withdrawal: <code>{float(min_w):.2f} Birr</code>", reply_markup=generate_fallback_navigation())
 
 @core_router.callback_query(F.data == "ui_fetch_referrals")
 async def process_referral_query(callback: CallbackQuery):
@@ -476,26 +475,30 @@ async def process_referral_query(callback: CallbackQuery):
     rate = float(await DataEngine.get_setting("reward_per_referral", "10"))
     me   = await bot.get_me()
     link = f"https://t.me/{me.username}?start={uid}"
-    await callback.message.edit_text(f"👥 <b>Your Referral Network:</b>\n\n• Total Referrals: <b>{direct} users</b>\n• Earnings per Referral: <b>{rate:.2f} Birr</b>\n• Total Earned: <b>{direct * rate:.2f} Birr</b>\n\n🔗 Your link:\n<code>{link}</code>", reply_markup=generate_fallback_navigation())
+    await callback.message.edit_text(f"👥 <b>Your Referral Network:</b>\n\n• Total Referrals: <b>{direct} users</b>\n• Earnings per Referral: <b>{rate:.2f} Birr</b>\n• Total Earned: <b>{float(direct * rate):.2f} Birr</b>\n\n🔗 Your link:\n<code>{link}</code>", reply_markup=generate_fallback_navigation())
 
 @core_router.callback_query(F.data == "ui_fetch_link")
 async def process_link_generation(callback: CallbackQuery):
     if not await enforce_membership_gate(callback, callback.from_user.id): return
     me = await bot.get_me()
-    await callback.message.edit_text(f"🔗 <b>Your Invite Link:</b>\n\n<code>https://t.me/{me.username}?start={callback.from_user.id}</code>", reply_markup=generate_fallback_navigation())
+    await callback.message.edit_text(f"🚀 <b>Your Invite Link / መጋበዣ ሊንክ:</b>\n\n<code>https://t.me/{me.username}?start={callback.from_user.id}</code>", reply_markup=generate_fallback_navigation())
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WITHDRAWAL CORE LOGIC
+# WITHDRAWAL CORE LOGIC & CALCULATION FIX
 # ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "ui_initiate_withdrawal")
 async def process_withdrawal_start(callback: CallbackQuery, state: FSMContext):
     if not await enforce_membership_gate(callback, callback.from_user.id): return
     user  = await DataEngine.get_user(callback.from_user.id)
     min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
-    if user["balance"] < min_w:
-        return await callback.answer(f"❌ Minimum payout baseline is {min_w} Birr.", show_alert=True)
+    
+    # የሂሳብ ማጣሪያ ስሌት ማስተካከያ (Float Type Precision Checking)
+    current_bal = round(float(user["balance"]), 2)
+    if current_bal < min_w:
+        return await callback.answer(f"❌ Minimum payout baseline is {min_w:.2f} Birr. Your balance is {current_bal:.2f} Birr.", show_alert=True)
+        
     await state.set_state(UserWithdrawalWorkflow.select_payout_gateway)
-    await state.update_data(cached_balance=user["balance"], cached_minimum=min_w)
+    await state.update_data(cached_balance=current_bal, cached_minimum=min_w)
     await callback.message.edit_text("💸 <b>Select Payout Endpoint:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📲 Telebirr / ቴሌብር", callback_data="gateway_telebirr")],
         [InlineKeyboardButton(text="❌ Cancel / ሰርዝ",      callback_data="ui_return_home")],
@@ -510,10 +513,13 @@ async def process_telebirr_selection(callback: CallbackQuery, state: FSMContext)
 async def process_cashout_volume(message: Message, state: FSMContext):
     s = await state.get_data()
     try:
-        val = float(message.text.strip())
-        assert s["cached_minimum"] <= val <= s["cached_balance"]
+        val = round(float(message.text.strip()), 2)
+        # ትክክለኛ የሒሳብ ማጣሪያ መስመር
+        if val < s["cached_minimum"] or val > s["cached_balance"]:
+            raise ValueError()
     except Exception:
-        return await message.answer("❌ Invalid amount. Check your balance and minimum limits.")
+        return await message.answer(f"❌ Invalid amount. Minimum: {s['cached_minimum']:.2f} | Maximum: {s['cached_balance']:.2f} Birr.")
+        
     await state.update_data(validated_volume=val)
     await state.set_state(UserWithdrawalWorkflow.provide_mobile_digits)
     await message.answer("📱 <b>Provide Destination Account Mobile Number:</b>")
@@ -546,7 +552,8 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
     s    = await state.get_data()
     uid  = callback.from_user.id
     user = await DataEngine.get_user(uid)
-    if user["balance"] < s["validated_volume"]:
+    
+    if round(float(user["balance"]), 2) < s["validated_volume"]:
         return await callback.answer("❌ Insufficient funds.", show_alert=True)
 
     tid = await DataEngine.create_withdrawal(uid, s["validated_volume"], s["validated_title"], s["validated_phone"])
@@ -561,14 +568,18 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
     post_id = 0
     if PAYMENT_LOG_CHANNEL:
         try:
+            # 📝 የProof ቻናል የጽሁፍ ዲዛይን ማሻሻያ (በመስመሮች የታጀበ)
             txt = (
-                f"⏳ <b>NEW WITHDRAWAL REQUEST</b>\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📥 <b>NEW WITHDRAWAL REQUEST</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"👤 <b>Account Holder Name:</b> {s['validated_title']}\n"
                 f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
                 f"💰 <b>Requested Amount:</b> ETB {s['validated_volume']:.2f}\n"
                 f"📱 <b>Method:</b> Telebirr Portal\n"
-                f"📊 <b>Status:</b> Pending Verification ⏳\n\n"
-                f"⏰ <b>Timestamp:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                f"📊 <b>Status:</b> Pending Verification ⏳\n"
+                f"⏰ <b>Timestamp:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━"
             )
             receipt = await bot.send_message(PAYMENT_LOG_CHANNEL, txt, reply_markup=bot_link_market)
             post_id = receipt.message_id
@@ -593,7 +604,7 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
     )
     markup = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Approve (ይለቀቅ)",  callback_data=f"adm_payout_ap_{tid}"),
-        InlineKeyboardButton(text="❌ Deny (ውድቅ አድርግ)",     callback_data=f"adm_payout_rj_{tid}"),
+        InlineKeyboardButton(text="❌ Deny (ውድቅ አድርግ)",     callback_data=f"adm_payout_rjmenu_{tid}"),
     ]])
     for aid in ADMIN_IDS:
         try: await bot.send_message(aid, admin_txt, reply_markup=markup)
@@ -601,6 +612,9 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
 
     await callback.message.edit_text("📨 <b>Withdrawal Submitted!</b> Processing within 2-24 hours.", reply_markup=generate_dashboard_matrix(uid))
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN APPROVE & DENY WITH REASON LOGIC
+# ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data.startswith("adm_payout_ap_"))
 async def process_admin_approval(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
@@ -613,10 +627,13 @@ async def process_admin_approval(callback: CallbackQuery):
     if PAYMENT_LOG_CHANNEL and ticket["channel_post_id"]:
         try:
             txt = (
-                f"✅ <b>PAYOUT SETTLEMENT COMPLETED SUCCESSFULLY</b>\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ <b>PAYOUT SETTLEMENT COMPLETED</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"👤 <b>Recipient:</b> {ticket['full_name']}\n"
                 f"💰 <b>Amount:</b> ETB {ticket['amount']:.2f}\n"
-                f"🚀 <b>Operational Registry:</b> Verified Success ✅"
+                f"🚀 <b>Operational Registry:</b> Verified Success ✅\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━"
             )
             await bot.send_photo(
                 chat_id=PAYMENT_LOG_CHANNEL, 
@@ -631,31 +648,131 @@ async def process_admin_approval(callback: CallbackQuery):
     except Exception: pass
     await callback.message.edit_text(callback.message.text + "\n\n✅ Ticket Approved.")
 
-@core_router.callback_query(F.data.startswith("adm_payout_rj_"))
-async def process_admin_rejection(callback: CallbackQuery):
+# Rejection Reason Selection Menu
+@core_router.callback_query(F.data.startswith("adm_payout_rjmenu_"))
+async def process_admin_rejection_menu(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
-    tid    = int(callback.data.split("_")[3])
-    ticket = await DataEngine.get_withdrawal(tid)
-    if not ticket or ticket["status"] != "pending": return await callback.answer("Already evaluated.")
+    tid = int(callback.data.split("_")[3])
     
-    await DataEngine.update_withdrawal_status(tid, "rejected", ticket["channel_post_id"])
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 Multi-bot / Clone Account", callback_data=f"rj_select_{tid}_multi_bot")],
+        [InlineKeyboardButton(text="❌ Fake Activity / Emulators", callback_data=f"rj_select_{tid}_fake_activity")],
+        [InlineKeyboardButton(text="👥 በቂ ሰው አልጋበዘም (No Invites)", callback_data=f"rj_select_{tid}_no_invites")],
+        [InlineKeyboardButton(text="✍️ Write Custom Reason (በጽሁፍ)", callback_data=f"rj_select_{tid}_write_custom")],
+        [InlineKeyboardButton(text="🔙 Cancel", callback_data="ui_admin_core")]
+    ])
+    await callback.message.edit_text("❌ <b>የውድቅ ማድረጊያ ምክንያት ይምረጡ ወይም ይጻፉ:</b>", reply_markup=markup)
+
+@core_router.callback_query(F.data.startswith("rj_select_"))
+async def process_reason_selection(callback: CallbackQuery, state: FSMContext):
+    if not evaluate_admin_access(callback.from_user.id): return
+    parts = callback.data.split("_")
+    tid = int(parts[2])
+    choice = "_".join(parts[3:])
+    
+    ticket = await DataEngine.get_withdrawal(tid)
+    if not ticket or ticket["status"] != "pending": return await callback.answer("Already processed.")
+
+    if choice == "write_custom":
+        await state.set_state(AdminConsoleWorkflow.write_reject_reason)
+        await state.update_data(active_reject_tid=tid)
+        return await callback.message.edit_text("✍️ <b>እባክዎ ለተጠቃሚው የሚላከውን ምክንያት ይጻፉ:</b>")
+        
+    reason_map = {
+        "multi_bot": "Multi-account / Clone system detected.",
+        "fake_activity": "Fake verification / Fraudulent activity detected.",
+        "no_invites": "በቂ ትክክለኛ ሰው አልጋበዙም (Insufficient organic referrals)."
+    }
+    reason = reason_map.get(choice, "Violated bot usage policies.")
+    await execute_withdrawal_rejection(callback.message, tid, ticket, reason)
+
+@core_router.message(AdminConsoleWorkflow.write_reject_reason)
+async def process_custom_written_reason(message: Message, state: FSMContext):
+    s = await state.get_data()
+    await state.clear()
+    tid = s["active_reject_tid"]
+    ticket = await DataEngine.get_withdrawal(tid)
+    if not ticket or ticket["status"] != "pending": return await message.answer("Ticket already processed.")
+    
+    reason = message.text.strip()
+    await execute_withdrawal_rejection(message, tid, ticket, reason)
+
+async def execute_withdrawal_rejection(msg_obj, tid, ticket, reason):
+    await DataEngine.update_withdrawal_status(tid, "rejected", ticket["channel_post_id"], reason)
     await DataEngine.add_balance(ticket["user_id"], ticket["amount"])
     
     if PAYMENT_LOG_CHANNEL and ticket["channel_post_id"]:
         try: 
-            await bot.send_message(
-                chat_id=PAYMENT_LOG_CHANNEL,
-                text=f"❌ <b>REQUEST DENIED / REJECTED</b>\n\n👤 {ticket['full_name']} — Request for ETB {ticket['amount']:.2f} was cancelled by admin.",
-                reply_to_message_id=ticket["channel_post_id"]
+            txt = (
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"❌ <b>REQUEST DENIED / REJECTED</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 {ticket['full_name']}\n"
+                f"💰 Amount: ETB {ticket['amount']:.2f}\n"
+                f"⚠️ Reason: {reason}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━"
             )
+            await bot.send_message(chat_id=PAYMENT_LOG_CHANNEL, text=txt, reply_to_message_id=ticket["channel_post_id"])
         except Exception: pass
 
-    try: await bot.send_message(ticket["user_id"], "❌ Withdrawal request rejected. Assets have been returned to your balance.")
+    try: 
+        await bot.send_message(
+            ticket["user_id"], 
+            f"❌ <b>የክፍያ ጥያቄዎ ውድቅ ተደርጓል!</b>\n\n💰 መጠን: {ticket['amount']:.2f} Birr\n⚠️ ምክንያት: {reason}\n\nብር ወደ መለያዎ ተመልሷል።"
+        )
     except Exception: pass
-    await callback.message.edit_text(callback.message.text + "\n\n❌ Ticket Rejected.")
+    
+    if isinstance(msg_obj, Message):
+        await msg_obj.answer(f"✅ Ticket #{tid} has been successfully rejected. Reason: {reason}", reply_markup=generate_admin_dashboard())
+    else:
+        await msg_obj.edit_text(f"✅ Ticket #{tid} has been successfully rejected. Reason: {reason}", reply_markup=generate_admin_dashboard())
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ADMIN CONTROL PANEL
+# BROADCAST WITH CONFIRMATION AND EDIT LOGIC
+# ─────────────────────────────────────────────────────────────────────────────
+@core_router.callback_query(F.data == "adm_cmd_broadcast")
+async def process_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    if not evaluate_admin_access(callback.from_user.id): return
+    await state.set_state(AdminConsoleWorkflow.broadcast_intel_payload)
+    await callback.message.edit_text("📢 <b>Enter Broadcast Payload Text (የሚላከውን ጽሁፍ ያስገቡ):</b>", reply_markup=generate_fallback_navigation("ui_admin_core"))
+
+@core_router.message(AdminConsoleWorkflow.broadcast_intel_payload)
+async def process_broadcast_preview(message: Message, state: FSMContext):
+    text = message.text
+    await state.update_data(bc_payload=text)
+    await state.set_state(AdminConsoleWorkflow.broadcast_confirmation)
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 አሁን አሰራጭ (Send Now)", callback_data="bc_action_confirm")],
+        [InlineKeyboardButton(text="✍️ መልዕክቱን ቀይር (Edit)", callback_data="adm_cmd_broadcast")],
+        [InlineKeyboardButton(text="❌ ሰርዝ (Cancel)", callback_data="ui_admin_core")]
+    ])
+    await message.answer(f"📝 <b>የመልዕክት ቅድመ-ዕይታ (Preview):</b>\n\n{text}\n\n⚠️ እርግጠኛ ነዎት ይህ መልዕክት ለሁሉም ተጠቃሚዎች እንዲሰራጭ ይፈልጋሉ?", reply_markup=markup)
+
+@core_router.callback_query(F.data == "bc_action_confirm", AdminConsoleWorkflow.broadcast_confirmation)
+async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
+    s = await state.get_data()
+    text = s["bc_payload"]
+    await state.clear()
+    
+    progress = await callback.message.edit_text("⏳ Dispersing broadcast vectors... እባክዎ ይጠብቁ...")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM users")
+        nodes = await cur.fetchall()
+        
+    sc = 0
+    for (uid,) in nodes:
+        try:
+            await bot.send_message(uid, text)
+            sc += 1
+            await asyncio.sleep(0.04) # Rate limit protection
+        except Exception: pass
+        
+    await progress.delete()
+    await callback.message.answer(f"✅ Transmission secure. Sent to {sc} active nodes.", reply_markup=generate_admin_dashboard())
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN OPERATION CONTROLS (REST OF CODE)
 # ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "ui_admin_core")
 async def process_admin_panel(callback: CallbackQuery):
@@ -739,9 +856,6 @@ async def process_rm_channel_action(callback: CallbackQuery):
         await db.commit()
     await callback.message.edit_text("✅ Channel configuration removed.", reply_markup=generate_admin_dashboard())
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 🛑 STOP BOT SYSTEM WITH DOUBLE CONFIRMATION
-# ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "adm_stop_bot_confirm1")
 async def stop_bot_first_confirmation(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
@@ -772,12 +886,8 @@ async def stop_bot_final_confirmation(callback: CallbackQuery):
 async def execute_bot_shutdown(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
     await callback.message.edit_text("💀 <b>Bot engine system is shutting down... Goodbye!</b>")
-    logger.critical("Admin requested manual engine shutdown. Terminating process loops.")
     sys.exit(0)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONTINUED ADMIN LOGIC
-# ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "adm_cmd_edit_bal")
 async def process_edit_balance_start(callback: CallbackQuery, state: FSMContext):
     if not evaluate_admin_access(callback.from_user.id): return
@@ -803,31 +913,7 @@ async def process_stats(callback: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT COUNT(*), SUM(balance) FROM users")
         row = await cur.fetchone()
-    await callback.message.edit_text(f"📊 <b>Bot Network Core Analytics:</b>\n\n• Registered Users: <b>{row[0] or 0}</b>\n• Outstanding Liabilities: <b>{row[1] or 0.0:.2f} ETB</b>", reply_markup=generate_fallback_navigation("ui_admin_core"))
-
-@core_router.callback_query(F.data == "adm_cmd_broadcast")
-async def process_broadcast_start(callback: CallbackQuery, state: FSMContext):
-    if not evaluate_admin_access(callback.from_user.id): return
-    await state.set_state(AdminConsoleWorkflow.broadcast_intel_payload)
-    await callback.message.edit_text("📢 <b>Enter Broadcast Payload Text:</b>", reply_markup=generate_fallback_navigation("ui_admin_core"))
-
-@core_router.message(AdminConsoleWorkflow.broadcast_intel_payload)
-async def process_broadcast_execute(message: Message, state: FSMContext):
-    text = message.text
-    await state.clear()
-    progress = await message.answer("⏳ Dispersing broadcast vectors...")
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id FROM users")
-        nodes = await cur.fetchall()
-    sc = 0
-    for (uid,) in nodes:
-        try:
-            await bot.send_message(uid, text)
-            sc += 1
-            await asyncio.sleep(0.04)
-        except Exception: pass
-    await progress.delete()
-    await message.answer(f"✅ Transmission secure. Sent to {sc} active nodes.", reply_markup=generate_admin_dashboard())
+    await callback.message.edit_text(f"📊 <b>Bot Network Core Analytics:</b>\n\n• Registered Users: <b>{row[0] or 0}</b>\n• Outstanding Liabilities: <b>{float(row[1] or 0.0):.2f} ETB</b>", reply_markup=generate_fallback_navigation("ui_admin_core"))
 
 @core_router.callback_query(F.data == "adm_cmd_search")
 async def process_search_start(callback: CallbackQuery, state: FSMContext):
@@ -843,7 +929,7 @@ async def process_search_execute(message: Message, state: FSMContext):
     if not user: return await message.answer("❌ User not found.", reply_markup=generate_admin_dashboard())
     direct, tier2 = await DataEngine.get_referral_metrics(target)
     await message.answer(
-        f"👤 <b>User Matrix Profile:</b>\n\n• Name: {user['full_name']}\n• Alias: @{user['username'] or 'N/A'}\n• Balance: <b>{user['balance']:.2f} Birr</b>\n"
+        f"👤 <b>User Matrix Profile:</b>\n\n• Name: {user['full_name']}\n• Alias: @{user['username'] or 'N/A'}\n• Balance: <b>{float(user['balance']):.2f} Birr</b>\n"
         f"• Direct Invites: <b>{direct}</b>\n• Tier-2 Network: <b>{tier2}</b>\n• Banned Status: <b>{'Yes' if user['is_banned'] else 'No'}</b>\n• Joined: {user['joined_at']}",
         reply_markup=generate_admin_dashboard()
     )
@@ -901,11 +987,11 @@ async def process_pending_inventory(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
     pending = await DataEngine.get_pending_withdrawals()
     if not pending: return await callback.message.edit_text("📭 No pending withdrawals.", reply_markup=generate_fallback_navigation("ui_admin_core"))
-    lines = [f"• <b>#{t['id']}</b> — {t['full_name']} — <code>{t['amount']:.2f} ETB</code>" for t in pending]
+    lines = [f"• <b>#{t['id']}</b> — {t['full_name']} — <code>{float(t['amount']):.2f} ETB</code>" for t in pending]
     await callback.message.edit_text(f"📥 <b>Pending Withdrawal Inventory ({len(pending)})</b>\n\n" + "\n".join(lines), reply_markup=generate_fallback_navigation("ui_admin_core"))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI APP & ANTI-FRAUD VERIFICATION CORE
+# FASTAPI APP & LIFESPAN
 # ─────────────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def application_lifespan(app: FastAPI):
@@ -945,24 +1031,7 @@ async def execute_verification(request: Request):
         return JSONResponse({"status": "already_verified"})
 
     fingerprint = data.get("fingerprint", "").strip()
-    
     if not fingerprint or fingerprint in ("undefined", "null", ""):
-        await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
-        await DataEngine.ban_user(uid, 1)
-        if msg_id > 0:
-            try: await bot.delete_message(chat_id=uid, message_id=msg_id)
-            except Exception: pass
-        return JSONResponse({"status": "blocked", "reason": "clone"})
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT user_id FROM verifications WHERE fingerprint = ? AND user_id != ? LIMIT 1",
-            (fingerprint, uid),
-        )
-        duplicate_device = await cur.fetchone()
-
-    if duplicate_device:
         await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
         await DataEngine.ban_user(uid, 1)
         if msg_id > 0:
@@ -975,13 +1044,14 @@ async def execute_verification(request: Request):
     else: client_ip = request.client.host if request.client else "unknown"
 
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT user_id FROM verifications WHERE ip_address = ? AND user_id != ? LIMIT 1",
-            (client_ip, uid),
+            "SELECT user_id FROM verifications WHERE fingerprint = ? AND ip_address = ? AND user_id != ? LIMIT 1",
+            (fingerprint, client_ip, uid),
         )
-        duplicate_ip = await cur.fetchone()
+        duplicate_identity = await cur.fetchone()
 
-    if duplicate_ip:
+    if duplicate_identity:
         await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
         await DataEngine.ban_user(uid, 1)
         if msg_id > 0:
@@ -1003,7 +1073,7 @@ async def execute_verification(request: Request):
     if ref_id and ref_id != uid:
         bounty = float(await DataEngine.get_setting("reward_per_referral", "10"))
         await DataEngine.add_balance(ref_id, bounty)
-        try: await bot.send_message(ref_id, f"🎉 <b>Referral verified!</b> <code>+{bounty} Birr</code> credited.")
+        try: await bot.send_message(ref_id, f"🎉 <b>Referral verified!</b> <code>+{bounty:.2f} Birr</code> credited.")
         except Exception: pass
 
     try: await bot.send_message(uid, "✅ <b>Verification Confirmed! Access Granted.</b>", reply_markup=generate_dashboard_matrix(uid))
