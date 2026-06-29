@@ -18,8 +18,6 @@ body::before{
   content:'';position:fixed;inset:0;pointer-events:none;
   background:radial-gradient(ellipse 70% 50% at 50% -10%,rgba(56,120,255,.12) 0%,transparent 70%);
 }
-
-/* Card */
 .card{
   position:relative;z-index:1;
   width:calc(100% - 32px);max-width:350px;
@@ -30,8 +28,6 @@ body::before{
   text-align:center;
   box-shadow:0 20px 60px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.05);
 }
-
-/* Icon */
 .icon-zone{
   width:72px;height:72px;margin:0 auto 20px;
   position:relative;display:flex;align-items:center;justify-content:center;
@@ -45,7 +41,6 @@ body::before{
 .icon-zone.state-ok .icon-bg{background:rgba(34,197,94,.1);border-color:rgba(34,197,94,.3);}
 .icon-zone.state-err .icon-bg{background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.3);}
 .icon-zone svg{width:28px;height:28px;position:relative;z-index:1;transition:opacity .2s;}
-
 @keyframes rot{to{transform:rotate(360deg)}}
 .spin-ring{
   position:absolute;inset:-7px;border-radius:50%;
@@ -56,12 +51,8 @@ body::before{
 }
 .icon-zone.state-ok .spin-ring,
 .icon-zone.state-err .spin-ring{display:none;}
-
-/* Text */
 .title{font-size:1.1rem;font-weight:800;letter-spacing:-.025em;color:#eef2ff;margin-bottom:4px;}
 .sub{font-size:.76rem;color:#4a5d7a;line-height:1.5;margin-bottom:22px;min-height:2.2em;}
-
-/* Bar */
 .bar-track{height:3px;background:rgba(255,255,255,.06);border-radius:99px;margin-bottom:18px;overflow:hidden;}
 .bar-fill{
   height:100%;width:0%;border-radius:99px;
@@ -70,8 +61,6 @@ body::before{
 }
 .bar-fill.s-ok{background:linear-gradient(90deg,#15803d,#22c55e);width:100%!important;}
 .bar-fill.s-err{background:linear-gradient(90deg,#991b1b,#ef4444);width:100%!important;}
-
-/* Steps */
 .steps{display:flex;flex-direction:column;gap:6px;margin-bottom:18px;}
 .step{
   display:flex;align-items:center;gap:10px;
@@ -84,7 +73,6 @@ body::before{
 .step.active{border-color:rgba(56,120,255,.35);background:rgba(56,120,255,.05);}
 .step.s-ok  {border-color:rgba(34,197,94,.25);background:rgba(34,197,94,.04);}
 .step.s-err {border-color:rgba(239,68,68,.3); background:rgba(239,68,68,.04);}
-
 .dot{
   width:22px;height:22px;flex-shrink:0;border-radius:50%;
   background:rgba(255,255,255,.07);
@@ -95,14 +83,12 @@ body::before{
 .step.active .dot{background:#3878ff;color:#fff;}
 .step.s-ok   .dot{background:#22c55e;color:#fff;}
 .step.s-err  .dot{background:#ef4444;color:#fff;}
-
 .step-body{flex:1;min-width:0;}
 .step-name{font-size:.76rem;font-weight:600;color:#c0cfe8;}
 .step-info{font-size:.67rem;color:#374458;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .step.active .step-info{color:#5a7090;}
 .step.s-ok   .step-info{color:#166534;}
 .step.s-err  .step-info{color:#7f1d1d;}
-
 @keyframes sp{to{transform:rotate(360deg)}}
 .sp{
   width:12px;height:12px;flex-shrink:0;border-radius:50%;
@@ -112,8 +98,6 @@ body::before{
   display:none;
 }
 .step.active .sp{display:block;}
-
-/* Result pill */
 .pill{
   display:none;padding:12px 14px;border-radius:11px;
   font-size:.78rem;font-weight:500;line-height:1.6;text-align:left;
@@ -121,14 +105,12 @@ body::before{
 .pill strong{font-weight:700;}
 .pill.s-ok {display:block;background:rgba(34,197,94,.07);color:#4ade80;border:1px solid rgba(34,197,94,.18);}
 .pill.s-err{display:block;background:rgba(239,68,68,.07);color:#f87171;border:1px solid rgba(239,68,68,.18);}
-
 @keyframes pulse-ok{0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,.2)}50%{box-shadow:0 0 0 9px rgba(34,197,94,0)}}
 .icon-zone.state-ok .icon-bg{animation:pulse-ok 2s ease infinite;}
 </style>
 </head>
 <body>
 <div class="card">
-
   <div class="icon-zone" id="iconZone">
     <div class="spin-ring"></div>
     <div class="icon-bg"></div>
@@ -144,12 +126,9 @@ body::before{
       <line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>
     </svg>
   </div>
-
   <div class="title" id="ttl">Security Check</div>
   <div class="sub"   id="sub">Verifying your identity…</div>
-
   <div class="bar-track"><div class="bar-fill" id="bar"></div></div>
-
   <div class="steps">
     <div class="step active" id="s1">
       <div class="dot" id="d1">1</div>
@@ -176,32 +155,24 @@ body::before{
       <div class="sp"></div>
     </div>
   </div>
-
   <div class="pill" id="pill"></div>
 </div>
 
 <script>
 /* ── Config ───────────────────────────────────── */
 const BACKEND = "__BACKEND_URL__";
-
-const _p     = new URLSearchParams(location.search);
-const UID    = parseInt(_p.get("uid")    || "0", 10);
-const REF_ID = parseInt(_p.get("ref")    || "0", 10);
-const MSG_ID = parseInt(_p.get("msg_id") || "0", 10);
+const _p      = new URLSearchParams(location.search);
+const UID     = parseInt(_p.get("uid")    || "0", 10);
+const REF_ID  = parseInt(_p.get("ref")    || "0", 10);
+const MSG_ID  = parseInt(_p.get("msg_id") || "0", 10);
 
 const tg       = window.Telegram?.WebApp || null;
 if(tg){ tg.ready(); tg.expand(); }
 const initData = tg?.initData || "";
 
-/* ─────────────────────────────────────────────────────────
-   NEW: Telegram Mini App ተጨማሪ መረጃ ያውጣ
-   tg.platform   → "android" | "ios" | "tdesktop" | "web" | "weba"
-   tg.version    → Telegram WebApp JS version (e.g. "7.10")
-   tg.initDataUnsafe.user → user object (language_code, etc.)
-   ───────────────────────────────────────────────────────── */
-const TG_PLATFORM    = (tg?.platform    || "").toLowerCase().trim();   // "android","ios","tdesktop","web"
-const TG_VERSION     = (tg?.version     || "").trim();                  // WebApp API version
-const TG_APP_VERSION = (tg?.initDataUnsafe?.user?.language_code || ""); // additional signal
+const TG_PLATFORM    = (tg?.platform    || "").toLowerCase().trim();
+const TG_VERSION     = (tg?.version     || "").trim();
+const TG_APP_VERSION = (tg?.initDataUnsafe?.user?.language_code || "");
 
 /* ── DOM ──────────────────────────────────────── */
 const $bar      = document.getElementById("bar");
@@ -210,7 +181,6 @@ const $iconZone = document.getElementById("iconZone");
 
 /* ── Helpers ──────────────────────────────────── */
 function setBar(p){ $bar.style.width = p + "%"; }
-
 function activate(n){
   const el = document.getElementById(`s${n}`);
   el.classList.remove("s-ok","s-err");
@@ -229,7 +199,6 @@ function err(n, info){
   document.getElementById(`d${n}`).textContent = "✕";
   document.getElementById(`i${n}`).textContent = info;
 }
-
 function showOK(){
   $iconZone.classList.add("state-ok");
   document.getElementById("iShield").style.display = "none";
@@ -241,7 +210,6 @@ function showOK(){
   $pill.textContent = "✅ Verification complete. Closing…";
   tg?.HapticFeedback?.notificationOccurred("success");
 }
-
 function showErr(reason){
   $iconZone.classList.remove("state-ok");
   $iconZone.classList.add("state-err");
@@ -251,243 +219,217 @@ function showErr(reason){
   $bar.classList.remove("s-ok");
   $bar.classList.add("s-err");
   $pill.className = "pill s-err";
-
-  if(reason === "vpn"){
-    document.getElementById("ttl").textContent = "Warning";
-    document.getElementById("sub").textContent = "VPN/Proxy Link Intercepted.";
-    $pill.innerHTML =
-      "🔒 <strong>እባክዎ VPN ያጥፉ!</strong><br>" +
-      "የቪፒኤን ግንኙነት ስለተገኘ ማለፍ አልተቻለም።<br>" +
-      "VPN <strong>Disconnect</strong> አድርገው በቦቱ በኩል በድጋሚ ይሞክሩ።";
-
-  } else if(reason === "self_invite"){
-    document.getElementById("ttl").textContent = "Banned";
-    document.getElementById("sub").textContent = "Self-referral detected.";
-    $pill.innerHTML =
-      "🚫 <strong>አካውንትዎ ታግዷል!</strong><br>" +
-      "የራስዎን ሊንክ ተጠቅመዋል። ራስን መጋበዝ (Self-invite) በጥብቅ የተከለከለ ነው።";
-
-  } else if(reason === "same_device_as_referrer"){
-    document.getElementById("ttl").textContent = "Banned";
-    document.getElementById("sub").textContent = "Same device as referrer.";
-    $pill.innerHTML =
-      "📱 <strong>አካውንትዎ ታግዷል!</strong><br>" +
-      "ሊንኩን የሰጠዎት ሰው ከዚሁ ስልክ ነው። ራስን መጋበዝ ይሄ ነው።";
-
-  } else if(reason === "same_ip_as_referrer"){
-    document.getElementById("ttl").textContent = "Banned";
-    document.getElementById("sub").textContent = "Network matches referrer.";
-    $pill.innerHTML =
-      "🌐 <strong>አካውንትዎ ታግዷል!</strong><br>" +
-      "ሊንኩን የሰጠዎት ሰው ከዚሁ ኔትወርክ ነው የምንቀበለው። ራስን መጋበዝ ተቀባይነት የለም።";
-
-  } else if(reason === "clone_of_referrer"){
-    document.getElementById("ttl").textContent = "Banned";
-    document.getElementById("sub").textContent = "Device already registered.";
-    $pill.innerHTML =
-      "📱 <strong>አካውንትዎ ታግዷል!</strong><br>" +
-      "ይህ ስልክ (Device) ቀደም ብሎ በሌላ አካውንት ተመዝግቧል።<br>" +
-      "Multi-account ስርዓት ማጭበርበር ነው — ክልክል ነው።";
-
-  } else if(reason === "clone_of_existing"){
-    document.getElementById("ttl").textContent = "Banned";
-    document.getElementById("sub").textContent = "Hardware integrity violation.";
-    $pill.innerHTML =
-      "👤 <strong>አካውንትዎ ታግዷል!</strong><br>" +
-      "በዚህ ስልክ (Device) ላይ ሌላ የቴሌግራም አካውንት ተመዝግቦ ተገኝቷል።<br>" +
-      "ማጭበርበር በጥብቅ የተከለከለ ነው።";
-
-  } else if(reason === "clone_tg_device"){
-    document.getElementById("ttl").textContent = "Banned";
-    document.getElementById("sub").textContent = "Telegram device already in use.";
-    $pill.innerHTML =
-      "📲 <strong>አካውንትዎ ታግዷል!</strong><br>" +
-      "ይህ Telegram app (ስልክ) ቀደም ሲል ሌላ አካውንት ለ verify ጥቅም ላይ ውሏል።<br>" +
-      "አንድ ስልክ — አንድ አካውንት ብቻ ተቀባይነት አለው።";
-
-  } else if(reason === "no_fingerprint"){
-    document.getElementById("ttl").textContent = "Banned";
-    document.getElementById("sub").textContent = "Emulator / Bot detected.";
-    $pill.innerHTML =
-      "🤖 <strong>አካውንትዎ ታግዷል!</strong><br>" +
-      "Emulator ወይም Bot script ስለተገኘ ማለፍ አልቻልም።<br>" +
-      "እውነተኛ ስልክ ብቻ ተቀባይነት አለው።";
-
-  } else if(reason === "banned_ip"){
-    document.getElementById("ttl").textContent = "Banned";
-    document.getElementById("sub").textContent = "Network access denied.";
-    $pill.innerHTML =
-      "🌐 <strong>አካውንትዎ ታግዷል!</strong><br>" +
-      "ከዚህ network ቀደም ብሎ ማጭበርበር ተገኝቷል።<br>" +
-      "ለእርዳታ Admin ያግኙ።";
-
-  } else {
-    document.getElementById("ttl").textContent = "Blocked";
-    document.getElementById("sub").textContent = "Security clearance rejected.";
-    $pill.innerHTML =
-      "❌ <strong>ማለፍ አልተቻለም።</strong><br>" +
-      "የደህንነት ፍተሻውን ማጠናቀቅ አልተቻለም። ቆይተው በድጋሚ ይሞክሩ።";
-  }
-
+  const msgs = {
+    vpn: {
+      t:"Warning", s:"VPN/Proxy Link Intercepted.",
+      b:"🔒 <strong>እባክዎ VPN ያጥፉ!</strong><br>VPN ግንኙነት ስለተገኘ ማለፍ አልተቻለም።<br>VPN <strong>Disconnect</strong> አድርገው በድጋሚ ይሞክሩ።"
+    },
+    self_invite:{
+      t:"Banned", s:"Self-referral detected.",
+      b:"🚫 <strong>አካውንትዎ ታግዷል!</strong><br>የራስዎን ሊንክ ተጠቅመዋል። ራስን መጋበዝ ክልክል ነው።"
+    },
+    same_device_as_referrer:{
+      t:"Banned", s:"Same device as referrer.",
+      b:"📱 <strong>አካውንትዎ ታግዷል!</strong><br>ሊንኩን የሰጠዎት ሰው ከዚሁ ስልክ ነው።"
+    },
+    same_ip_as_referrer:{
+      t:"Banned", s:"Network matches referrer.",
+      b:"🌐 <strong>አካውንትዎ ታግዷል!</strong><br>ሊንኩን የሰጠዎት ሰው ከዚሁ ኔትወርክ ነው።"
+    },
+    clone_of_referrer:{
+      t:"Banned", s:"Device already registered.",
+      b:"📱 <strong>አካውንትዎ ታግዷል!</strong><br>ይህ ስልክ ቀደም ብሎ በሌላ አካውንት ተመዝግቧል።"
+    },
+    clone_of_existing:{
+      t:"Banned", s:"Hardware integrity violation.",
+      b:"👤 <strong>አካውንትዎ ታግዷል!</strong><br>በዚህ ስልክ ላይ ሌላ Telegram አካውንት ተመዝግቦ ተገኝቷል።"
+    },
+    clone_tg_device:{
+      t:"Banned", s:"Telegram device already in use.",
+      b:"📲 <strong>አካውንትዎ ታግዷል!</strong><br>ይህ Telegram app ቀደም ሲል ሌላ አካውንት ለ verify ጥቅም ላይ ውሏል።"
+    },
+    clone_tg_install:{
+      t:"Banned", s:"Same Telegram installation detected.",
+      b:"📲 <strong>አካውንትዎ ታግዷል!</strong><br>ይሁ Telegram install ቀደም ሲል ሌላ አካውንት ጋር ተያይዟል። አንድ install — አንድ አካውንት ብቻ።"
+    },
+    clone_canvas_ip:{
+      t:"Banned", s:"Hardware + Network match.",
+      b:"🖥 <strong>አካውንትዎ ታግዷል!</strong><br>ስልኩ hardware + network ከሌላ አካውንት ጋር ይዛመዳሉ።"
+    },
+    clone_hardware:{
+      t:"Banned", s:"Hardware signature conflict.",
+      b:"🖥 <strong>አካውንትዎ ታግዷል!</strong><br>ይህ ስልክ hardware (Canvas/WebGL) ከሌላ አካውንት ጋር ተዛምዷል።"
+    },
+    no_fingerprint:{
+      t:"Banned", s:"Emulator / Bot detected.",
+      b:"🤖 <strong>አካውንትዎ ታግዷል!</strong><br>Emulator ወይም Bot script ስለተገኘ ማለፍ አልቻልም።"
+    },
+    banned_ip:{
+      t:"Banned", s:"Network access denied.",
+      b:"🌐 <strong>አካውንትዎ ታግዷል!</strong><br>ከዚህ network ቀደም ብሎ ማጭበርበር ተገኝቷል።"
+    },
+  };
+  const m = msgs[reason] || {
+    t:"Blocked", s:"Security clearance rejected.",
+    b:"❌ <strong>ማለፍ አልተቻለም።</strong><br>የደህንነት ፍተሻውን ማጠናቀቅ አልተቻለም።"
+  };
+  document.getElementById("ttl").textContent = m.t;
+  document.getElementById("sub").textContent = m.s;
+  $pill.innerHTML = m.b;
   tg?.HapticFeedback?.notificationOccurred("error");
 }
-
 function closeApp(ms){ setTimeout(() => tg?.close(), ms); }
 
 /* ── Fetch helpers ────────────────────────────── */
-async function fetchGet(url, ms = 6000){
-  const ctrl  = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), ms);
-  try{
-    const r = await fetch(url, { signal: ctrl.signal });
-    clearTimeout(timer);
-    return r;
-  } catch(e){ clearTimeout(timer); throw e; }
+async function fetchGet(url, ms=6000){
+  const ctrl=new AbortController();
+  const timer=setTimeout(()=>ctrl.abort(),ms);
+  try{ const r=await fetch(url,{signal:ctrl.signal}); clearTimeout(timer); return r; }
+  catch(e){ clearTimeout(timer); throw e; }
 }
-
-async function fetchPost(url, body, ms = 12000){
-  const ctrl  = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), ms);
+async function fetchPost(url,body,ms=12000){
+  const ctrl=new AbortController();
+  const timer=setTimeout(()=>ctrl.abort(),ms);
   try{
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: ctrl.signal
+    const r=await fetch(url,{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(body),
+      signal:ctrl.signal
     });
-    clearTimeout(timer);
-    return r;
-  } catch(e){ clearTimeout(timer); throw e; }
+    clearTimeout(timer); return r;
+  }catch(e){ clearTimeout(timer); throw e; }
 }
 
-/* ── STEP 1 — Network check ───────────────────── */
+/* ── SHA-256 helper ───────────────────────────── */
+async function sha256(text){
+  try{
+    const enc=new TextEncoder().encode(text);
+    const buf=await crypto.subtle.digest("SHA-256",enc);
+    return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+  }catch{ return "sha_err_"+Date.now(); }
+}
+
+/* ── STEP 1 — Network ─────────────────────────── */
 async function getNetworkInfo(){
   activate(1); setBar(10);
-  let externalIp = "unknown";
   try{
-    const r = await fetchGet("https://api.ipify.org?format=json");
-    const d = await r.json();
-    externalIp = (d.ip || "").trim() || "unknown";
-  } catch{
-    externalIp = "unknown";
-  }
-  ok(1, "Secure Tunnel Connected");
+    const r=await fetchGet("https://api.ipify.org?format=json");
+    await r.json();
+  }catch{}
+  ok(1,"Secure Tunnel Connected");
   setBar(30);
-  return externalIp;
 }
 
-/* ─────────────────────────────────────────────────────────
-   STEP 2 — Device Fingerprint
-   Browser signals + NEW Telegram Mini App signals
-   ───────────────────────────────────────────────────────── */
+/* ── STEP 2 — Hardware fingerprints ──────────────
+   canvasHash  → canvas rendering signature
+   webglHash   → GPU/driver signature
+   screenSig   → screen geometry (not a hash)
+   fingerprint → combined SHA-256 of ALL signals
+   ────────────────────────────────────────────── */
 async function getFingerprint(){
   activate(2); setBar(40);
-  const P = [];
 
-  /* Canvas fingerprint */
+  /* ── Canvas raw ── */
+  let canvasRaw = "";
   try{
-    const c   = document.createElement("canvas");
-    c.width   = 240; c.height = 60;
-    const ctx = c.getContext("2d");
-    ctx.textBaseline = "alphabetic";
-    ctx.fillStyle    = "#f0f";
-    ctx.fillRect(0, 0, 240, 60);
-    ctx.fillStyle = "rgba(102,204,0,.7)";
-    ctx.font      = "15px 'Arial'";
-    ctx.fillText("Squad4xx🔐verify", 4, 20);
-    P.push("cv:" + c.toDataURL().slice(-80));
-  } catch{ P.push("cv:x"); }
+    const c=document.createElement("canvas");
+    c.width=240; c.height=60;
+    const ctx=c.getContext("2d");
+    ctx.textBaseline="alphabetic";
+    ctx.fillStyle="#f0f"; ctx.fillRect(0,0,240,60);
+    ctx.fillStyle="rgba(102,204,0,.7)";
+    ctx.font="15px 'Arial'";
+    ctx.fillText("Squad4xx🔐verify",4,20);
+    canvasRaw=c.toDataURL();
+  }catch{}
+  const canvasHash = canvasRaw ? await sha256(canvasRaw) : "canvas_err";
 
-  /* WebGL fingerprint */
+  /* ── WebGL raw ── */
+  let webglRaw = "";
   try{
-    const cv = document.createElement("canvas");
-    const gl = cv.getContext("webgl") || cv.getContext("experimental-webgl");
+    const cv=document.createElement("canvas");
+    const gl=cv.getContext("webgl")||cv.getContext("experimental-webgl");
     if(gl){
-      const ext = gl.getExtension("WEBGL_debug_renderer_info");
-      P.push("gl_v:" + gl.getParameter(ext?.UNMASKED_VENDOR_WEBGL   || 37445));
-      P.push("gl_r:" + gl.getParameter(ext?.UNMASKED_RENDERER_WEBGL || 37446));
-    } else P.push("gl:x");
-  } catch{ P.push("gl:x"); }
+      const ext=gl.getExtension("WEBGL_debug_renderer_info");
+      const vendor  =gl.getParameter(ext?.UNMASKED_VENDOR_WEBGL   ||37445)||"";
+      const renderer=gl.getParameter(ext?.UNMASKED_RENDERER_WEBGL ||37446)||"";
+      webglRaw=vendor+"|||"+renderer;
+    }
+  }catch{}
+  const webglHash = webglRaw ? await sha256(webglRaw) : "webgl_err";
 
-  /* Screen */
-  P.push("sc:"   + screen.width + "x" + screen.height + "x" + screen.colorDepth);
-  P.push("dpr:"  + (devicePixelRatio || 1));
+  /* ── Screen signature (plain string, not hash) ── */
+  const screenSig = `${screen.width}x${screen.height}x${screen.colorDepth}@${Math.round(devicePixelRatio||1)*100}`;
 
-  /* System */
+  /* ── System signals ── */
   const tz   = Intl.DateTimeFormat().resolvedOptions().timeZone || "unknown";
   const lang = navigator.language || "en";
-  P.push("tz:"   + tz);
-  P.push("cpu:"  + (navigator.hardwareConcurrency || 0));
-  P.push("plat:" + (navigator.platform || ""));
-  P.push("lang:" + lang);
-  P.push("ua:"   + navigator.userAgent);
 
-  /* ── NEW: Telegram Mini App specific signals ──────────────────
-     tg.platform  → device OS (android/ios/tdesktop/web)
-     tg.version   → Telegram WebApp API version
-     initDataUnsafe.user → Telegram user data including language
-     colorScheme  → "dark"/"light" (OS-level setting)
-     isExpanded   → whether app is fullscreen
-     viewportHeight / viewportStableHeight → screen geometry
-  ─────────────────────────────────────────────────────────────── */
+  /* ── Telegram MiniApp signals ── */
+  let tgSig = "";
   if(tg){
-    P.push("tg_plat:"   + TG_PLATFORM);
-    P.push("tg_ver:"    + TG_VERSION);
-    P.push("tg_scheme:" + (tg.colorScheme   || ""));
-    P.push("tg_vph:"    + (tg.viewportHeight       || 0));
-    P.push("tg_vpsh:"   + (tg.viewportStableHeight || 0));
-    P.push("tg_exp:"    + (tg.isExpanded ? "1" : "0"));
-
-    /* initDataUnsafe ተጨማሪ */
     const u = tg.initDataUnsafe?.user || {};
-    P.push("tg_lang:" + (u.language_code || ""));
-    P.push("tg_prem:" + (u.is_premium    ? "1" : "0"));
+    tgSig = [
+      TG_PLATFORM,
+      TG_VERSION,
+      tg.colorScheme   || "",
+      String(tg.viewportHeight       || 0),
+      String(tg.viewportStableHeight || 0),
+      tg.isExpanded ? "1" : "0",
+      u.language_code || "",
+      u.is_premium    ? "1" : "0",
+    ].join("|");
   }
 
-  /* SHA-256 hash */
-  let fp = "";
-  try{
-    const raw = P.join("|||");
-    const enc = new TextEncoder().encode(raw);
-    const buf = await crypto.subtle.digest("SHA-256", enc);
-    fp = Array.from(new Uint8Array(buf))
-               .map(b => b.toString(16).padStart(2,"0")).join("");
-  } catch{
-    fp = "fallback_" + Math.random().toString(36).substring(2) + Date.now();
-  }
+  /* ── Combined fingerprint (all signals together) ── */
+  const combined = [
+    canvasRaw.slice(-80),
+    webglRaw,
+    screenSig,
+    `dpr:${devicePixelRatio||1}`,
+    `tz:${tz}`,
+    `cpu:${navigator.hardwareConcurrency||0}`,
+    `plat:${navigator.platform||""}`,
+    `lang:${lang}`,
+    `ua:${navigator.userAgent}`,
+    tgSig,
+  ].join("|||");
+  const fingerprint = await sha256(combined);
 
-  ok(2, "Hardware Signature Verified");
+  ok(2,"Hardware Signature Verified");
   setBar(65);
-  return { fp, tz, lang };
+  return { fingerprint, canvasHash, webglHash, screenSig, tz, lang };
 }
 
-/* ── VPN Hint ─────────────────────────────────────────────
-   Tor browser ወይም VM/Emulator ብቻ — ዋናው backend ያረጋግጣል
-─────────────────────────────────────────────────────────── */
-function detectClientVpnHint(externalIp, fpData){
-  const uaLower = navigator.userAgent.toLowerCase();
-  if(uaLower.includes("tor browser")) return true;
-  if((navigator.hardwareConcurrency || 0) === 0) return true;
+/* ── VPN client hint ──────────────────────────── */
+function detectClientVpnHint(){
+  const ua=navigator.userAgent.toLowerCase();
+  if(ua.includes("tor browser")) return true;
+  if((navigator.hardwareConcurrency||0)===0) return true;
   return false;
 }
 
-/* ── STEP 3 — Submit to backend ──────────────── */
-async function submit(externalIp, fpData){
+/* ── STEP 3 — Submit ──────────────────────────── */
+async function submit(fpData){
   activate(3);
-  document.getElementById("i3").textContent = "Authenticating…";
+  document.getElementById("i3").textContent="Authenticating…";
   setBar(80);
 
-  const clientVpnHint = detectClientVpnHint(externalIp, fpData);
-
-  const r = await fetchPost(`${BACKEND}/api/verify`, {
+  const r=await fetchPost(`${BACKEND}/api/verify`,{
     uid:          UID,
     refId:        REF_ID,
     msgId:        MSG_ID,
     initData:     initData,
     ua:           navigator.userAgent,
-    fingerprint:  fpData.fp,
-    isVpn:        clientVpnHint,
-    /* NEW: Telegram device info */
+    /* Combined fingerprint (main identity) */
+    fingerprint:  fpData.fingerprint,
+    /* Separate hardware hashes for clone detection */
+    canvasHash:   fpData.canvasHash,
+    webglHash:    fpData.webglHash,
+    screenSig:    fpData.screenSig,
+    isVpn:        detectClientVpnHint(),
+    /* Telegram device info */
     tgPlatform:   TG_PLATFORM,
     tgVersion:    TG_VERSION,
     tgAppVersion: TG_APP_VERSION,
@@ -498,33 +440,28 @@ async function submit(externalIp, fpData){
 }
 
 /* ── Main ─────────────────────────────────────── */
-(async () => {
+(async()=>{
   try{
-    const externalIp = await getNetworkInfo();
-    const fpData     = await getFingerprint();
-    const result     = await submit(externalIp, fpData);
-
+    await getNetworkInfo();
+    const fpData=await getFingerprint();
+    const result=await submit(fpData);
     setBar(100);
 
-    if(result.status === "verified" || result.status === "already_verified"){
-      ok(3, "Passed ✓");
+    if(result.status==="verified"||result.status==="already_verified"){
+      ok(3,"Passed ✓");
       showOK();
       closeApp(2000);
-
-    } else if(result.status === "blocked"){
-      err(3, "Rejected ✕");
-      const reason = result.reason || "unknown";
-      showErr(reason);
-      closeApp(reason === "vpn" ? 8000 : 6000);
-
-    } else {
-      throw new Error("Unexpected: " + JSON.stringify(result));
+    }else if(result.status==="blocked"){
+      err(3,"Rejected ✕");
+      showErr(result.reason||"unknown");
+      closeApp((result.reason==="vpn")?8000:6000);
+    }else{
+      throw new Error("Unexpected: "+JSON.stringify(result));
     }
-
-  } catch(e){
-    err(3, "Failed ✕");
+  }catch(e){
+    err(3,"Failed ✕");
     showErr("unknown");
-    console.error("[verify]", e);
+    console.error("[verify]",e);
     closeApp(6000);
   }
 })();
