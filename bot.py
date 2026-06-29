@@ -447,6 +447,20 @@ async def process_link_generation(callback: CallbackQuery):
     await callback.message.edit_text(f"🔗 <b>Your Invite Link:</b>\n\n<code>https://t.me/{me.username}?start={callback.from_user.id}</code>", reply_markup=generate_fallback_navigation())
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 🟢 ADMIN UTILITY: Get file_id from a photo (Admin sends a photo in private
+# chat to the bot, bot replies with the file_id — copy this into
+# TELEBIRR_PROOF_IMAGE to fix the proof channel photo post).
+# ─────────────────────────────────────────────────────────────────────────────
+@core_router.message(F.photo)
+async def process_get_file_id(message: Message):
+    if not evaluate_admin_access(message.from_user.id): return
+    file_id = message.photo[-1].file_id
+    await message.answer(
+        f"📸 <b>File ID Captured:</b>\n\n<code>{file_id}</code>\n\n"
+        f"⚠️ Copy this value and replace <code>TELEBIRR_PROOF_IMAGE</code> in the code with it."
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def evaluate_admin_access(user_id: int) -> bool:
@@ -686,16 +700,16 @@ async def process_admin_approval(callback: CallbackQuery):
     # 🔥 Completed proof post (WITH PHOTO) sent as a Reply to the original
     # pending-request post in the proof channel.
     if PAYMENT_LOG_CHANNEL and ticket["channel_post_id"]:
+        txt = (
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"✅ <b>WITHDRAWAL COMPLETED</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👤 <b>Recipient:</b> {ticket['full_name']}\n\n"
+            f"💰 <b>Amount:</b> ETB {ticket['amount']:.2f}\n\n"
+            f"🚀 <b>Operational Registry:</b> Success ✅\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━"
+        )
         try:
-            txt = (
-                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"✅ <b>WITHDRAWAL COMPLETED</b>\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"👤 <b>Recipient:</b> {ticket['full_name']}\n\n"
-                f"💰 <b>Amount:</b> ETB {ticket['amount']:.2f}\n\n"
-                f"🚀 <b>Operational Registry:</b> Success ✅\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━"
-            )
             await bot.send_photo(
                 chat_id=PAYMENT_LOG_CHANNEL,
                 photo=TELEBIRR_PROOF_IMAGE,
@@ -704,7 +718,19 @@ async def process_admin_approval(callback: CallbackQuery):
                 reply_markup=proof_channel_keyboard
             )
         except Exception as e:
-            logger.error(f"Proof Channel Reply Post Error: {e}")
+            # 🟢 FIX: Photo file_id failed (likely invalid/expired/belongs to a
+            # different bot). Fall back to a text-only reply so the channel
+            # ALWAYS gets a completion post — it never silently does nothing.
+            logger.error(f"Proof Channel Photo Post Error (falling back to text): {e}")
+            try:
+                await bot.send_message(
+                    chat_id=PAYMENT_LOG_CHANNEL,
+                    text=txt,
+                    reply_to_message_id=ticket["channel_post_id"],
+                    reply_markup=proof_channel_keyboard
+                )
+            except Exception as e2:
+                logger.error(f"Proof Channel Text Fallback Post Error: {e2}")
 
     try: await bot.send_message(ticket["user_id"], f"🎉 Your cashout of {ticket['amount']:.2f} Birr has been successfully approved and sent via Telebirr!")
     except Exception: pass
