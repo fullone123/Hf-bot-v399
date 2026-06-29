@@ -55,7 +55,7 @@ DB_PATH              = "referral_bot.db"
 # 🟢 FIX: Telebirr proof image file_id — used in the "Withdrawal Completed" proof post.
 # This was missing, which is why send_photo had nothing to send and the code had
 # fallen back to a text-only send_message.
-TELEBIRR_PROOF_IMAGE = "AgACAgQAAxkBAAOYai38ooud5iofBd3aDGuCiX273t8AAj4PaxsYl3BR78MpfA_cDpkBAAMCAAN4AAM8BA"
+TELEBIRR_PROOF_IMAGE = "AgACAgQAAxkBAAO6akLJQYxDTMsMCF_TJ1mfprGQg9oAAqgOaxv6JBFSsp0Sw79o0x0BAAMCAAN4AAM8BA"
 
 if not WEBAPP_URL.startswith(("http://", "https://")):
     WEBAPP_URL = f"https://{WEBAPP_URL}"
