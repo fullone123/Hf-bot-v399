@@ -52,6 +52,11 @@ WEBAPP_URL           = os.getenv("WEBAPP_URL", "http://localhost:8000").rstrip("
 PROXYCHECK_API_KEY   = os.getenv("PROXYCHECK_API_KEY", "")
 DB_PATH              = "referral_bot.db"
 
+# 🟢 FIX: Telebirr proof image file_id — used in the "Withdrawal Completed" proof post.
+# This was missing, which is why send_photo had nothing to send and the code had
+# fallen back to a text-only send_message.
+TELEBIRR_PROOF_IMAGE = "AgACAgQAAxkBAAOYai38ooud5iofBd3aDGuCiX273t8AAj4PaxsYl3BR78MpfA_cDpkBAAMCAAN4AAM8BA"
+
 if not WEBAPP_URL.startswith(("http://", "https://")):
     WEBAPP_URL = f"https://{WEBAPP_URL}"
 
@@ -326,10 +331,10 @@ async def inspect_compulsory_memberships(user_id: int) -> list:
 
 async def enforce_membership_gate(event, user_id: int) -> bool:
     unjoined = await inspect_compulsory_memberships(user_id)
-    
+
     is_callback = isinstance(event, CallbackQuery)
     current_data = event.data if is_callback else ""
-    
+
     if not is_callback or current_data in ("ui_return_home", ""):
         all_channels = await DataEngine.get_force_channels()
         for ch in all_channels:
@@ -345,9 +350,9 @@ async def enforce_membership_gate(event, user_id: int) -> bool:
         buttons.append([InlineKeyboardButton(text=f"➕ Join: {ch['channel_name']}", url=ch["invite_link"])])
 
     buttons.append([InlineKeyboardButton(text="✅ Joined / ተቀላቅያለሁ", callback_data="ui_revalidate_channels")])
-    
+
     txt = "👋 <b>Welcome!</b>\n\nእባክዎ ከታች ያሉትን ሁሉንም ቻናሎች ይቀላቀሉ፣ ከዚያም <b>'Joined'</b> የሚለውን በተን ይጫኑ።\n\nPlease join all channels and continue."
-    
+
     if isinstance(event, Message):
         await event.answer(txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     elif isinstance(event, CallbackQuery):
@@ -359,7 +364,7 @@ async def enforce_membership_gate(event, user_id: int) -> bool:
 async def process_channel_revalidation(callback: CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
     channels = await DataEngine.get_force_channels()
-    
+
     real_unjoined = []
     for ch in channels:
         if ch["bot_added"] == 0:
@@ -369,13 +374,13 @@ async def process_channel_revalidation(callback: CallbackQuery, state: FSMContex
                     real_unjoined.append(ch)
             except Exception:
                 real_unjoined.append(ch)
-                
+
     if real_unjoined:
         return await callback.answer("❌ Please join all channels and continue.", show_alert=True)
-    
+
     try: await callback.message.delete()
     except Exception: pass
-    
+
     s = await state.get_data()
     ref = s.get("stashed_referrer_id", 0)
     await state.clear()
@@ -458,11 +463,11 @@ async def process_withdrawal_start(callback: CallbackQuery, state: FSMContext):
     if not await enforce_membership_gate(callback, callback.from_user.id): return
     user  = await DataEngine.get_user(callback.from_user.id)
     min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
-    
+
     current_bal = round(float(user["balance"]), 2)
     if current_bal < min_w:
         return await callback.answer(f"❌ Minimum payout baseline is {min_w:.2f} Birr. Your balance is {current_bal:.2f} Birr.", show_alert=True)
-        
+
     await state.set_state(UserWithdrawalWorkflow.select_payout_gateway)
     await state.update_data(cached_balance=current_bal, cached_minimum=min_w)
     await callback.message.edit_text("💸 <b>Select Payout Endpoint:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -484,7 +489,7 @@ async def process_cashout_volume(message: Message, state: FSMContext):
             return await message.answer(f"❌ Invalid amount. Minimum withdrawal is {s['cached_minimum']:.2f} ETB.\n⚠️ <b>Your balance is:</b> {s['cached_balance']:.2f} ETB.")
     except Exception:
         return await message.answer(f"❌ Please enter a valid number.\n⚠️ <b>Your balance is:</b> {s['cached_balance']:.2f} ETB.")
-        
+
     await state.update_data(validated_volume=val)
     await state.set_state(UserWithdrawalWorkflow.provide_mobile_digits)
     await message.answer("📱 <b>Provide Destination Account Mobile Number:</b>")
@@ -517,7 +522,7 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
     s    = await state.get_data()
     uid  = callback.from_user.id
     user = await DataEngine.get_user(uid)
-    
+
     if round(float(user["balance"]), 2) < s["validated_volume"]:
         return await callback.answer("❌ Insufficient funds.", show_alert=True)
 
@@ -586,25 +591,28 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
 async def process_admin_view_invites(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
     target_uid = int(callback.data.split("_")[3])
-    
+
     invited_nodes = await DataEngine.get_all_invited_users(target_uid)
     if not invited_nodes:
         return await callback.answer("📭 This user has not invited anyone yet.", show_alert=True)
-        
+
     lines = []
     for idx, node in enumerate(invited_nodes, 1):
         uname = f"@{node['username']}" if node['username'] else "No Username"
         lines.append(f"{idx}. {node['full_name']} ({uname}) - ID: <code>{node['user_id']}</code>\n📅 Joined: {node['joined_at']}")
-        
+
     chunk_txt = f"👥 <b>List of Invited Users for ID {target_uid}:</b>\n\n" + "\n\n".join(lines)
     if len(chunk_txt) > 4000:
         chunk_txt = chunk_txt[:4000] + "\n\n⚠️...List truncated due to length limits."
-        
+
     await bot.send_message(chat_id=callback.from_user.id, text=chunk_txt, reply_markup=generate_fallback_navigation("ui_admin_core"))
     await callback.answer()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ADMIN APPROVE MANAGEMENT (Fixed: Posts a completely new Reply Message instead of Edit)
+# ADMIN APPROVE MANAGEMENT
+# 🟢 FIX APPLIED HERE: now sends the Telebirr proof PHOTO (with the completed
+# caption) as a reply to the original pending request post in the proof
+# channel — instead of a text-only message.
 # ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data.startswith("adm_payout_ap_"))
 async def process_admin_approval(callback: CallbackQuery):
@@ -614,13 +622,14 @@ async def process_admin_approval(callback: CallbackQuery):
     if not ticket or ticket["status"] != "pending": return await callback.answer("Already processed.")
 
     await DataEngine.update_withdrawal_status(tid, "approved", ticket["channel_post_id"])
-    
+
     me = await bot.get_me()
     proof_channel_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}?start={ticket['user_id']}")
     ]])
 
-    # 🔥 እዚህ ጋ ነው የተቀየረው! አዲሱ Completed ፖስት ለድሮው Request ፖስት በ Reply መልዕክት እንዲላክ ተደርጓል
+    # 🔥 Completed proof post (WITH PHOTO) sent as a Reply to the original
+    # pending-request post in the proof channel.
     if PAYMENT_LOG_CHANNEL and ticket["channel_post_id"]:
         try:
             txt = (
@@ -632,15 +641,16 @@ async def process_admin_approval(callback: CallbackQuery):
                 f"🚀 <b>Operational Registry:</b> Success ✅\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━"
             )
-            await bot.send_message(
+            await bot.send_photo(
                 chat_id=PAYMENT_LOG_CHANNEL,
-                text=txt,
-                reply_to_message_id=ticket["channel_post_id"], # ለድሮው ፖስት በ Reply ይላካል!
+                photo=TELEBIRR_PROOF_IMAGE,
+                caption=txt,
+                reply_to_message_id=ticket["channel_post_id"],  # ለድሮው ፖስት በ Reply ይላካል!
                 reply_markup=proof_channel_keyboard
             )
         except Exception as e:
             logger.error(f"Proof Channel Reply Post Error: {e}")
-            
+
     try: await bot.send_message(ticket["user_id"], f"🎉 Your cashout of {ticket['amount']:.2f} Birr has been successfully approved and sent via Telebirr!")
     except Exception: pass
     await callback.message.edit_text(callback.message.text + "\n\n✅ Ticket Approved.")
@@ -649,7 +659,7 @@ async def process_admin_approval(callback: CallbackQuery):
 async def process_admin_rejection_menu(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
     tid = int(callback.data.split("_")[3])
-    
+
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🤖 Multi-bot / Clone Account", callback_data=f"rj_select_{tid}_multi_bot")],
         [InlineKeyboardButton(text="❌ Fake Activity / Emulators", callback_data=f"rj_select_{tid}_fake_activity")],
@@ -665,7 +675,7 @@ async def process_reason_selection(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
     tid = int(parts[2])
     choice = "_".join(parts[3:])
-    
+
     ticket = await DataEngine.get_withdrawal(tid)
     if not ticket or ticket["status"] != "pending": return await callback.answer("Already processed.")
 
@@ -673,7 +683,7 @@ async def process_reason_selection(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminConsoleWorkflow.write_reject_reason)
         await state.update_data(active_reject_tid=tid)
         return await callback.message.edit_text("✍️ <b>እባክዎ ለተጠቃሚው የሚላከውን ምክንያት ይጻፉ:</b>")
-        
+
     reason_map = {
         "multi_bot": "Multi-account / Clone system detected.",
         "fake_activity": "Fake verification / Fraudulent activity detected.",
@@ -689,13 +699,13 @@ async def process_custom_written_reason(message: Message, state: FSMContext):
     tid = s["active_reject_tid"]
     ticket = await DataEngine.get_withdrawal(tid)
     if not ticket or ticket["status"] != "pending": return await message.answer("Ticket already processed.")
-    
+
     reason = message.text.strip()
     await execute_withdrawal_rejection(message, tid, ticket, reason)
 
 async def execute_withdrawal_rejection(msg_obj, tid, ticket, reason):
     await DataEngine.update_withdrawal_status(tid, "rejected", ticket["channel_post_id"], reason)
-    
+
     warning_notice = (
         f"❌ <b>Your Withdrawal Request has been Rejected! / የክፍያ ጥያቄዎ ውድቅ ተደርጓል!</b>\n\n"
         f"💰 <b>Amount / መጠን:</b> <code>{ticket['amount']:.2f} Birr</code>\n"
@@ -709,7 +719,7 @@ async def execute_withdrawal_rejection(msg_obj, tid, ticket, reason):
 
     try: await bot.send_message(chat_id=ticket["user_id"], text=warning_notice)
     except Exception: pass
-    
+
     if isinstance(msg_obj, Message):
         await msg_obj.answer(f"✅ Ticket #{tid} rejected. User notified in private mode. No channel post made.", reply_markup=generate_admin_dashboard())
     else:
@@ -921,7 +931,7 @@ async def process_broadcast_preview(message: Message, state: FSMContext):
     text = message.text
     await state.update_data(bc_payload=text)
     await state.set_state(AdminConsoleWorkflow.broadcast_confirmation)
-    
+
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 አሁን አሰራጭ (Send Now)", callback_data="bc_action_confirm")],
         [InlineKeyboardButton(text="✍️ መልዕክቱን ቀይር (Edit)", callback_data="adm_cmd_broadcast")],
@@ -934,12 +944,12 @@ async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
     s = await state.get_data()
     text = s["bc_payload"]
     await state.clear()
-    
+
     progress = await callback.message.edit_text("⏳ Dispersing broadcast vectors... እባክዎ ይጠብቁ...")
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT user_id FROM users")
         nodes = await cur.fetchall()
-        
+
     sc = 0
     for (uid,) in nodes:
         try:
@@ -947,7 +957,7 @@ async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
             sc += 1
             await asyncio.sleep(0.04)
         except Exception: pass
-        
+
     await progress.delete()
     await callback.message.answer(f"✅ Transmission secure. Sent to {sc} active nodes.", reply_markup=generate_admin_dashboard())
 
