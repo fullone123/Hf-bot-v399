@@ -245,7 +245,7 @@ class DataEngine:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT * FROM withdrawals WHERE status='pending' ORDER BY created_at")
-            return await cur.fetchall()
+            return await run.fetchall() if hasattr(cur, 'fetchall') else await cur.fetchall()
 
     @staticmethod
     async def add_force_channel(channel_id: str, channel_name: str, invite_link: str, bot_added: int = 0):
@@ -536,10 +536,11 @@ async def process_cashout_volume(message: Message, state: FSMContext):
     s = await state.get_data()
     try:
         val = round(float(message.text.strip()), 2)
+        # 💸 የተሳሳተ ባላንስ ሲያስገባ መልዕክቱ Your balance is እንዲል ተደርጓል!
         if val < s["cached_minimum"] or val > s["cached_balance"]:
-            raise ValueError()
+            return await message.answer(f"❌ Invalid amount. Minimum withdrawal is {s['cached_minimum']:.2f} ETB.\n⚠️ <b>Your balance is:</b> {s['cached_balance']:.2f} ETB.")
     except Exception:
-        return await message.answer(f"❌ Invalid amount. Minimum: {s['cached_minimum']:.2f} | Maximum: {s['cached_balance']:.2f} Birr.")
+        return await message.answer(f"❌ Please enter a valid number.\n⚠️ <b>Your balance is:</b> {s['cached_balance']:.2f} ETB.")
         
     await state.update_data(validated_volume=val)
     await state.set_state(UserWithdrawalWorkflow.provide_mobile_digits)
@@ -582,23 +583,25 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
     await state.clear()
 
     me = await bot.get_me()
+    # 🚀 በተኑ ላይ ያለው አማርኛ ጠፍቶ "🚀 Invite Now" ብቻ ሆኗል
     proof_channel_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🚀 Invite Now / አሁኑኑ ይጋብዙ", url=f"https://t.me/{me.username}?start={uid}")
+        InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}?start={uid}")
     ]])
 
     post_id = 0
     if PAYMENT_LOG_CHANNEL:
         try:
+            # ✨ የጽሁፍ ውበት እንዲኖረው Space (የመስመር ነፃ ቦታዎች) ተጨምረዋል
             txt = (
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📥 <b>NEW WITHDRAWAL REQUEST</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 <b>Account Holder Name:</b> {s['validated_title']}\n"
-                f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
-                f"💰 <b>Requested Amount:</b> ETB {s['validated_volume']:.2f}\n"
-                f"📱 <b>Method:</b> Telebirr Portal\n"
-                f"📊 <b>Status:</b> Pending Verification ⏳\n"
-                f"⏰ <b>Timestamp:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📥 <b>NEW WITHDRAWAL REQUEST</b>\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"👤 <b>Account Holder Name:</b> {s['validated_title']}\n\n"
+                f"🆔 <b>User ID:</b> <code>{uid}</code>\n\n"
+                f"💰 <b>Requested Amount:</b> ETB {s['validated_volume']:.2f}\n\n"
+                f"📱 <b>Method:</b> Telebirr Portal\n\n"
+                f"📊 <b>Status:</b> Pending Verification ⏳\n\n"
+                f"⏰ <b>Timestamp:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━"
             )
             receipt = await bot.send_message(PAYMENT_LOG_CHANNEL, txt, reply_markup=proof_channel_keyboard)
@@ -660,7 +663,7 @@ async def process_admin_view_invites(callback: CallbackQuery):
     await callback.answer()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ADMIN APPROVE & DENY MANAGEMENT (Proof Channel Reply Restored)
+# ADMIN APPROVE MANAGEMENT (Edit Message Layout - Fixed)
 # ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data.startswith("adm_payout_ap_"))
 async def process_admin_approval(callback: CallbackQuery):
@@ -672,31 +675,32 @@ async def process_admin_approval(callback: CallbackQuery):
     await DataEngine.update_withdrawal_status(tid, "approved", ticket["channel_post_id"])
     
     me = await bot.get_me()
+    # 🚀 በተኑ ላይ ያለው አማርኛ ጠፍቶ "🚀 Invite Now" ብቻ ሆኗል
     proof_channel_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🚀 Invite Now / አሁኑኑ ይጋብዙ", url=f"https://t.me/{me.username}?start={ticket['user_id']}")
+        InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}?start={ticket['user_id']}")
     ]])
 
-    # 🔄 Approve ሲደረግ ልክ እንደ ቀድሞው በProof channel መልዕክት ላይ Reply አድርጎ "Completed" የሚለውን ይለጥፋል
+    # 🔄 አዲስ ፖስት ሳይሆን የድሮውን ጽሁፍ በፎቶው ላይ "Completed" ብሎ Edit ብቻ ያደርጋል!
     if PAYMENT_LOG_CHANNEL and ticket["channel_post_id"]:
         try:
+            # ✨ ማራኪ እንዲሆን በመካከላቸው የ space ክፍተት ተጨምሯል
             txt = (
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"✅ <b>WITHDRAWAL COMPLETED</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 <b>Recipient:</b> {ticket['full_name']}\n"
-                f"💰 <b>Amount:</b> ETB {ticket['amount']:.2f}\n"
-                f"🚀 <b>Operational Registry:</b> Success ✅\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"✅ <b>WITHDRAWAL COMPLETED</b>\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"👤 <b>Recipient:</b> {ticket['full_name']}\n\n"
+                f"💰 <b>Amount:</b> ETB {ticket['amount']:.2f}\n\n"
+                f"🚀 <b>Operational Registry:</b> Success ✅\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━"
             )
-            await bot.send_photo(
-                chat_id=PAYMENT_LOG_CHANNEL, 
-                photo=TELEBIRR_PROOF_IMAGE, 
+            await bot.edit_message_caption(
+                chat_id=PAYMENT_LOG_CHANNEL,
+                message_id=ticket["channel_post_id"],
                 caption=txt,
-                reply_markup=proof_channel_keyboard,
-                reply_to_message_id=ticket["channel_post_id"]
+                reply_markup=proof_channel_keyboard
             )
         except Exception as e:
-            logger.error(f"Proof Channel Payout Update Error: {e}")
+            logger.error(f"Proof Channel Edit Caption Error: {e}")
             
     try: await bot.send_message(ticket["user_id"], f"🎉 Your cashout of {ticket['amount']:.2f} Birr has been successfully approved and sent via Telebirr!")
     except Exception: pass
@@ -817,7 +821,7 @@ async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(f"✅ Transmission secure. Sent to {sc} active nodes.", reply_markup=generate_admin_dashboard())
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ADVANCED UNBAN ENGINE (Full Unban Bypasses Mini App Restored)
+# ADVANCED UNBAN ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "adm_cmd_unban_menu")
 async def process_unban_dashboard(callback: CallbackQuery):
