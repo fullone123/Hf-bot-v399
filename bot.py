@@ -122,7 +122,6 @@ CREATE TABLE IF NOT EXISTS fake_join_seen (
     seen_at TEXT DEFAULT (datetime('now'))
 );
 
--- 🔒 FIX: IP ban table — stores banned IPs with reason and timestamp
 CREATE TABLE IF NOT EXISTS banned_ips (
     ip_address  TEXT PRIMARY KEY,
     reason      TEXT,
@@ -234,10 +233,8 @@ class DataEngine:
             cur = await db.execute("SELECT * FROM verifications WHERE user_id = ?", (user_id,))
             return await cur.fetchone()
 
-    # ── 🔒 FIX: IP ban helpers ─────────────────────────────────────────────
     @staticmethod
     async def is_ip_banned(ip: str) -> bool:
-        """Check if an IP is in the banned_ips table."""
         if not ip or ip in ("127.0.0.1", "::1", "unknown", "BYPASS_ADMIN"):
             return False
         async with aiosqlite.connect(DB_PATH) as db:
@@ -246,7 +243,6 @@ class DataEngine:
 
     @staticmethod
     async def ban_ip(ip: str, reason: str):
-        """Add an IP to the ban list."""
         if not ip or ip in ("127.0.0.1", "::1", "unknown", "BYPASS_ADMIN"):
             return
         async with aiosqlite.connect(DB_PATH) as db:
@@ -255,7 +251,6 @@ class DataEngine:
             )
             await db.commit()
 
-    # ── Withdrawal helpers ─────────────────────────────────────────────────
     @staticmethod
     async def create_withdrawal(user_id: int, amount: float, full_name: str, phone: str) -> int:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -289,7 +284,6 @@ class DataEngine:
             cur = await db.execute("SELECT * FROM withdrawals WHERE status='pending' ORDER BY created_at")
             return await cur.fetchall()
 
-    # ── Force channel helpers ──────────────────────────────────────────────
     @staticmethod
     async def add_force_channel(channel_id: str, channel_name: str, invite_link: str, bot_added: int = 0):
         async with aiosqlite.connect(DB_PATH) as db:
@@ -318,7 +312,6 @@ class DataEngine:
             await db.execute("INSERT OR IGNORE INTO fake_join_seen (user_id) VALUES (?)", (user_id,))
             await db.commit()
 
-    # ── Settings helpers ───────────────────────────────────────────────────
     _settings_cache: dict = {}
 
     @staticmethod
@@ -341,7 +334,7 @@ class DataEngine:
             await db.commit()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔒 FIX: SMART FRAUD DETECTION ENGINE
+# FRAUD DETECTION ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 async def evaluate_clone_risk(
     new_user_id: int,
@@ -349,26 +342,9 @@ async def evaluate_clone_risk(
     client_ip: str,
     fingerprint: str,
 ) -> tuple[bool, str]:
-    """
-    Returns (should_ban: bool, reason: str).
-
-    Rules (ALL must be met to ban — avoids false positives from shared IPs):
-
-    1. Self-invite check  — referrer_id == new_user_id  (instant ban, no IP needed)
-    2. Clone check        — BOTH IP *and* fingerprint match referrer's record
-       (IP alone is not enough — many people share IPs in Ethiopia/Africa)
-    3. Clone check        — BOTH IP *and* fingerprint match ANY existing verified user
-       (same logic: both signals required)
-
-    Fingerprint-only match (no IP match) → NOT banned, just logged.
-    IP-only match (no fingerprint match) → NOT banned at all.
-    """
-
-    # Rule 1 — self-invite (referral link abuse)
     if referrer_id and referrer_id == new_user_id:
         return True, "self_invite"
 
-    # Skip IP-based checks for local/unknown addresses
     ip_is_checkable = client_ip and client_ip not in ("127.0.0.1", "::1", "unknown")
 
     if not ip_is_checkable or not fingerprint:
@@ -377,7 +353,6 @@ async def evaluate_clone_risk(
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
-        # Rule 2 — referrer clone check (IP + fingerprint both match referrer)
         if referrer_id:
             cur = await db.execute(
                 "SELECT user_id FROM verifications WHERE user_id = ? AND ip_address = ? AND fingerprint = ?",
@@ -386,7 +361,6 @@ async def evaluate_clone_risk(
             if await cur.fetchone():
                 return True, "clone_of_referrer"
 
-        # Rule 3 — any existing user clone check (IP + fingerprint both match)
         cur = await db.execute(
             "SELECT user_id FROM verifications WHERE ip_address = ? AND fingerprint = ? AND user_id != ? LIMIT 1",
             (client_ip, fingerprint, new_user_id),
@@ -398,20 +372,11 @@ async def evaluate_clone_risk(
 
 
 def extract_real_ip(request: Request) -> str:
-    """
-    Safely extract the client IP from a request.
-
-    On Railway/Render/Nginx the real IP comes in X-Forwarded-For, but we
-    only trust the LAST entry in the chain (the one added by our own
-    reverse proxy), not the first (which the client can forge).
-    """
     forwarded = request.headers.get("X-Forwarded-For", "")
     if forwarded:
-        # Last entry = added by the trusted proxy closest to us
         parts = [p.strip() for p in forwarded.split(",") if p.strip()]
         if parts:
             return parts[-1]
-    # Fallback: direct connection (local dev)
     if request.client:
         return request.client.host
     return "unknown"
@@ -440,7 +405,7 @@ class AdminConsoleWorkflow(StatesGroup):
     broadcast_intel_payload  = State()
     broadcast_confirmation   = State()
     lookup_individual_id     = State()
-    ban_individual_id        = State()   # 🔒 FIX: dedicated ban state
+    ban_individual_id        = State()
     banish_individual_id     = State()
     pardon_individual_full   = State()
     pardon_individual_std    = State()
@@ -652,17 +617,31 @@ def parse_telegram_webapp_handshake(init_data: str) -> dict | None:
     except Exception:
         return None
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ✅ FIX: VPN CHECK — risk score 75+ ብቻ ያግዳል (LTE/mobile safe)
+# ─────────────────────────────────────────────────────────────────────────────
 async def execute_network_vpn_lookup(client_ip: str) -> bool:
+    """
+    proxycheck.io ን ይጠቀማል።
+    proxy=yes ብቻ አይበቃም — risk >= 75 ሁለቱም ካሉ ብቻ VPN ይላል።
+    LTE/mobile IPs risk < 75 ስለሆኑ ይለቀቃሉ።
+    """
     if not client_ip or client_ip in ("127.0.0.1", "::1", "unknown"):
         return False
     try:
         param = f"&key={PROXYCHECK_API_KEY}" if PROXYCHECK_API_KEY else ""
-        url   = f"https://proxycheck.io/v2/{client_ip}?vpn=1{param}"
-        async with httpx.AsyncClient(timeout=4) as c:
+        url   = f"https://proxycheck.io/v2/{client_ip}?vpn=1&risk=1{param}"
+        async with httpx.AsyncClient(timeout=5) as c:
             r = await c.get(url)
-            return r.json().get(client_ip, {}).get("proxy") == "yes"
+            d = r.json().get(client_ip, {})
+            proxy = d.get("proxy") == "yes"
+            risk  = int(d.get("risk", 0))
+            # ሁለቱም ካሉ ብቻ → true
+            return proxy and risk >= 75
     except Exception:
         return False
+
 
 def generate_verification_widget(user_id: int, ref: int, msg_id: int = 0):
     url = f"{WEBAPP_URL}/verify?uid={user_id}&ref={ref}&msg_id={msg_id}"
@@ -707,7 +686,6 @@ def generate_admin_dashboard() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(text="🔍 Search User",            callback_data="adm_cmd_search")],
         [
-            # 🔒 FIX: "Ban User" now has its own dedicated callback
             InlineKeyboardButton(text="🚫 Ban User",            callback_data="adm_cmd_ban"),
             InlineKeyboardButton(text="✅ Unban Dashboard",     callback_data="adm_cmd_unban_menu"),
         ],
@@ -814,8 +792,6 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
     if round(float(user["balance"]), 2) < s["validated_volume"]:
         return await callback.answer("❌ Insufficient funds.", show_alert=True)
 
-    # 🔒 FIX: Atomic transaction — create withdrawal AND deduct balance together.
-    # If either step fails, neither happens → no lost funds.
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
@@ -900,7 +876,7 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
 async def process_admin_view_invites(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id):
         return
-    target_uid   = int(callback.data.split("_")[3])
+    target_uid    = int(callback.data.split("_")[3])
     invited_nodes = await DataEngine.get_all_invited_users(target_uid)
     if not invited_nodes:
         return await callback.answer("📭 This user has not invited anyone yet.", show_alert=True)
@@ -962,7 +938,7 @@ async def process_admin_approval(callback: CallbackQuery):
                 reply_markup=proof_channel_keyboard
             )
         except Exception as e:
-            logger.error(f"Proof Photo Error (falling back to text): {e}")
+            logger.error(f"Proof Photo Error: {e}")
             try:
                 await bot.send_message(
                     chat_id=PAYMENT_LOG_CHANNEL,
@@ -1018,9 +994,9 @@ async def process_reason_selection(callback: CallbackQuery, state: FSMContext):
         return await callback.message.edit_text("✍️ <b>Write the rejection reason to send to user:</b>")
 
     reason_map = {
-        "multi_bot":      "Multi-account / Clone system detected.",
-        "fake_activity":  "Fake verification / Fraudulent activity detected.",
-        "no_invites":     "Insufficient organic or active referrals.",
+        "multi_bot":     "Multi-account / Clone system detected.",
+        "fake_activity": "Fake verification / Fraudulent activity detected.",
+        "no_invites":    "Insufficient organic or active referrals.",
     }
     reason = reason_map.get(choice, "Violated bot usage policies.")
     await execute_withdrawal_rejection(callback.message, tid, ticket, reason)
@@ -1044,8 +1020,8 @@ async def execute_withdrawal_rejection(msg_obj, tid, ticket, reason):
         f"⚠️ <b>Reason:</b> <code>{reason}</code>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📢 <b>IMPORTANT NOTICE:</b>\n"
-        f"🇬🇧 Please invite real, organic, and active users. Fake accounts and automated referrals are banned.\n\n"
-        f"🇪🇹 እባክዎ እውነተኛ ተጠቃሚዎችን ብቻ ይጋብዙ። ሐሰተኛ አካውንቶችን መጠቀም ይከለከላል።\n"
+        f"🇬🇧 Please invite real, organic, and active users.\n\n"
+        f"🇪🇹 እባክዎ እውነተኛ ተጠቃሚዎችን ብቻ ይጋብዙ።\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
     try:
@@ -1076,8 +1052,7 @@ async def process_add_channel_start(callback: CallbackQuery, state: FSMContext):
     if not evaluate_admin_access(callback.from_user.id): return
     await state.set_state(AdminConsoleWorkflow.append_mandatory_id)
     await callback.message.edit_text(
-        "🔴 <b>Force Join — Real Check (Bot Must Be Admin)</b>\n"
-        "Enter Channel ID (e.g. <code>-1001234567890</code>):",
+        "🔴 <b>Force Join — Real Check</b>\nEnter Channel ID (e.g. <code>-1001234567890</code>):",
         reply_markup=generate_fallback_navigation("ui_admin_core")
     )
 
@@ -1098,14 +1073,14 @@ async def process_add_channel_finalize(message: Message, state: FSMContext):
     s = await state.get_data()
     await state.clear()
     await DataEngine.add_force_channel(s["ch_id"], s["ch_title"], message.text.strip(), bot_added=0)
-    await message.answer(f"✅ <b>Real Force channel added!</b>\n📌 {s['ch_title']}", reply_markup=generate_admin_dashboard())
+    await message.answer(f"✅ <b>Force channel added!</b>\n📌 {s['ch_title']}", reply_markup=generate_admin_dashboard())
 
 @core_router.callback_query(F.data == "adm_cmd_add_noadmin")
 async def process_add_noadmin_start(callback: CallbackQuery, state: FSMContext):
     if not evaluate_admin_access(callback.from_user.id): return
     await state.set_state(AdminConsoleWorkflow.append_noadmin_link)
     await callback.message.edit_text(
-        "🟡 <b>Fake Join (No Admin Required)</b>\n\nየቻናሉን <b>ሊንክ</b> አስገባ (e.g. https://t.me/xxxx):",
+        "🟡 <b>Fake Join (No Admin Required)</b>\n\nየቻናሉን ሊንክ አስገባ:",
         reply_markup=generate_fallback_navigation("ui_admin_core")
     )
 
@@ -1113,7 +1088,7 @@ async def process_add_noadmin_start(callback: CallbackQuery, state: FSMContext):
 async def process_noadmin_link(message: Message, state: FSMContext):
     await state.update_data(na_link=message.text.strip())
     await state.set_state(AdminConsoleWorkflow.append_noadmin_title)
-    await message.answer("📝 <b>Enter Display Name for Fake Channel:</b>")
+    await message.answer("📝 <b>Enter Display Name:</b>")
 
 @core_router.message(AdminConsoleWorkflow.append_noadmin_title)
 async def process_noadmin_title(message: Message, state: FSMContext):
@@ -1123,14 +1098,14 @@ async def process_noadmin_title(message: Message, state: FSMContext):
     await DataEngine.add_force_channel(
         channel_id=fake_key, channel_name=message.text.strip(), invite_link=s["na_link"], bot_added=1
     )
-    await message.answer(f"✅ <b>Fake ማስመሰያ ቻናል ተጨምሯል!</b>\n📌 {message.text.strip()}", reply_markup=generate_admin_dashboard())
+    await message.answer(f"✅ <b>Fake ቻናል ተጨምሯል!</b>\n📌 {message.text.strip()}", reply_markup=generate_admin_dashboard())
 
 @core_router.callback_query(F.data == "adm_cmd_list_channels")
 async def process_list_channels(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
     channels = await DataEngine.get_force_channels()
     if not channels:
-        return await callback.message.edit_text("📭 No channels configured.", reply_markup=generate_fallback_navigation("ui_admin_core"))
+        return await callback.message.edit_text("📭 No channels.", reply_markup=generate_fallback_navigation("ui_admin_core"))
     lines = []
     for ch in channels:
         mode = "🟡 Fake" if ch["bot_added"] else "🔴 Real"
@@ -1145,7 +1120,7 @@ async def process_rm_channel_menu(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
     channels = await DataEngine.get_force_channels()
     if not channels:
-        return await callback.message.edit_text("📭 No channels to remove.", reply_markup=generate_fallback_navigation("ui_admin_core"))
+        return await callback.message.edit_text("📭 No channels.", reply_markup=generate_fallback_navigation("ui_admin_core"))
     buttons = []
     for ch in channels:
         mode = "🟡" if ch["bot_added"] else "🔴"
@@ -1163,7 +1138,7 @@ async def process_rm_channel_action(callback: CallbackQuery):
     await callback.message.edit_text("✅ Channel removed.", reply_markup=generate_admin_dashboard())
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔒 FIX: STOP BOT — graceful shutdown (stops polling only, keeps API alive)
+# ADMIN — STOP BOT
 # ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "adm_stop_bot_confirm1")
 async def stop_bot_first_confirmation(callback: CallbackQuery):
@@ -1173,8 +1148,7 @@ async def stop_bot_first_confirmation(callback: CallbackQuery):
         [InlineKeyboardButton(text="❌ አቁም/ተመለስ",               callback_data="ui_admin_core")],
     ])
     await callback.message.edit_text(
-        "🚨 <b>FIRST WARNING!</b>\n\nቦቱን ማቆም ከፈለጉ እርግጠኛ ነዎት?\n"
-        "⚠️ ይህ ቦቱ ከቴሌግራም ጋር ያለው polling ብቻ ያቆማል። Mini App/API አይዘጋም።",
+        "🚨 <b>FIRST WARNING!</b>\n\nቦቱን ማቆም ከፈለጉ እርግጠኛ ነዎት?",
         reply_markup=markup
     )
 
@@ -1182,21 +1156,15 @@ async def stop_bot_first_confirmation(callback: CallbackQuery):
 async def stop_bot_final_confirmation(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛑 አሁኑኑ ቦቱ ይቁም! (STOP POLLING)", callback_data="adm_stop_bot_execute")],
-        [InlineKeyboardButton(text="❌ ተመለስ",                           callback_data="ui_admin_core")],
+        [InlineKeyboardButton(text="🛑 አሁኑኑ ቦቱ ይቁም!", callback_data="adm_stop_bot_execute")],
+        [InlineKeyboardButton(text="❌ ተመለስ",          callback_data="ui_admin_core")],
     ])
-    await callback.message.edit_text(
-        "🛑 <b>FINAL CONFIRMATION!</b>\n\n"
-        "ይህንን ቢጫኑ የቦቱ polling ይቆማል። FastAPI/Mini App ግን ይቀጥላሉ።\n"
-        "ቦቱን እንደገና ለማስጀመር Railway restart ያስፈልጋል።",
-        reply_markup=markup
-    )
+    await callback.message.edit_text("🛑 <b>FINAL CONFIRMATION!</b>", reply_markup=markup)
 
 @core_router.callback_query(F.data == "adm_stop_bot_execute")
 async def execute_bot_shutdown(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
     await callback.message.edit_text("🛑 <b>Bot polling stopped. Mini App is still running.</b>")
-    # 🔒 FIX: stop polling only — FastAPI stays alive for Mini App users
     await dp.stop_polling()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1254,7 +1222,7 @@ async def process_search_execute(message: Message, state: FSMContext):
     if not user:
         return await message.answer("❌ User not found.", reply_markup=generate_admin_dashboard())
     direct, tier2 = await DataEngine.get_referral_metrics(target)
-    verif = await DataEngine.get_verification(target)
+    verif   = await DataEngine.get_verification(target)
     ip_info = f"<code>{verif['ip_address']}</code>" if verif else "Not verified"
     await message.answer(
         f"👤 <b>User Profile:</b>\n\n"
@@ -1270,7 +1238,7 @@ async def process_search_execute(message: Message, state: FSMContext):
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔒 FIX: DEDICATED BAN HANDLER
+# ADMIN — BAN USER
 # ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "adm_cmd_ban")
 async def process_ban_start(callback: CallbackQuery, state: FSMContext):
@@ -1369,17 +1337,14 @@ async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
         try:
             await bot.send_message(uid, text)
             sent_count += 1
-            # 🔒 FIX: proper rate limiting with RetryAfter handling
             await asyncio.sleep(0.05)
         except Exception as e:
             err_str = str(e)
             if "RetryAfter" in err_str:
-                # extract wait time and pause
                 try:
                     wait = int(''.join(filter(str.isdigit, err_str))) + 1
                 except Exception:
                     wait = 30
-                logger.warning(f"Broadcast flood wait: {wait}s")
                 await asyncio.sleep(wait)
                 try:
                     await bot.send_message(uid, text)
@@ -1410,9 +1375,7 @@ async def process_unban_dashboard(callback: CallbackQuery):
         [InlineKeyboardButton(text="🔙 Back",                               callback_data="ui_admin_core")],
     ])
     await callback.message.edit_text(
-        "🔓 <b>Select Unban Method:</b>\n\n"
-        "• <b>Standard:</b> Unban only — Mini App verification required on next /start.\n"
-        "• <b>Full:</b> Unban + inject verified record — direct menu access.",
+        "🔓 <b>Select Unban Method:</b>",
         reply_markup=markup
     )
 
@@ -1494,8 +1457,11 @@ async def serve_frontend(uid: int = 0, ref: int = 0, msg_id: int = 0):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Frontend missing: {e}")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔒 FIX: VERIFICATION ENDPOINT — SMART FRAUD DETECTION
+# ✅ FIX: VERIFICATION ENDPOINT
+# isVpn client hint ሙሉ በሙሉ ተሰርዟል — backend ብቻ ይወስናል
+# proxycheck.io: proxy=yes AND risk>=75 ሁለቱም ሲሆኑ ብቻ ያግዳል
 # ─────────────────────────────────────────────────────────────────────────────
 @api_platform.post("/api/verify")
 async def execute_verification(request: Request):
@@ -1520,18 +1486,14 @@ async def execute_verification(request: Request):
             except Exception: pass
         return JSONResponse({"status": "blocked", "reason": "no_fingerprint"})
 
-    # 🔒 FIX: use trusted proxy IP extraction
     client_ip = extract_real_ip(request)
 
-    # 🔒 FIX: check if this IP is already banned
     if await DataEngine.is_ip_banned(client_ip):
         await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
         await DataEngine.ban_user(uid, 1)
         return JSONResponse({"status": "blocked", "reason": "banned_ip"})
 
-    # 🔒 FIX: smart clone detection (IP + fingerprint BOTH must match — not IP alone)
     should_ban, ban_reason = await evaluate_clone_risk(uid, ref_id, client_ip, fingerprint)
-
     if should_ban:
         await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
         await DataEngine.ban_user(uid, 1)
@@ -1541,8 +1503,9 @@ async def execute_verification(request: Request):
         logger.warning(f"Clone detected: uid={uid} reason={ban_reason} ip={client_ip}")
         return JSONResponse({"status": "blocked", "reason": ban_reason})
 
-    # VPN check
-    is_vpn = data.get("isVpn") or await execute_network_vpn_lookup(client_ip)
+    # ✅ FIX: client isVpn hint ሙሉ በሙሉ ተሰርዟል
+    # backend proxycheck.io ብቻ ይወስናል (proxy=yes AND risk>=75)
+    is_vpn = await execute_network_vpn_lookup(client_ip)
     if is_vpn:
         return JSONResponse({"status": "blocked", "reason": "vpn"})
 
@@ -1567,6 +1530,7 @@ async def execute_verification(request: Request):
         pass
 
     return JSONResponse({"status": "verified"})
+
 
 if __name__ == "__main__":
     uvicorn.run("bot:api_platform", host="0.0.0.0", port=8000, log_level="info")
