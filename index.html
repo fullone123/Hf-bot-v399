@@ -232,17 +232,6 @@ function showOK(){
   tg?.HapticFeedback?.notificationOccurred("success");
 }
 
-/*
- * 🔒 FIX: showErr() reason values ከ bot.py ጋር ሙሉ በሙሉ ይዛዛማሉ።
- *
- * bot.py የሚልካቸው reason strings:
- *   "vpn"               → VPN/Proxy ተገኝቷል
- *   "clone_of_referrer" → referrer ጋር IP+fingerprint ተመሳሳለ (self-invite ያደረገ)
- *   "clone_of_existing" → ሌላ user ጋር IP+fingerprint ተመሳሳለ
- *   "self_invite"       → ራሱን ጋበዘ
- *   "no_fingerprint"    → fingerprint አልተላከም (emulator/bot)
- *   "banned_ip"         → IP ቀድሞ banned ነው
- */
 function showErr(reason){
   $iconZone.classList.remove("state-ok");
   $iconZone.classList.add("state-err");
@@ -254,7 +243,6 @@ function showErr(reason){
   $pill.className = "pill s-err";
 
   if(reason === "vpn"){
-    // VPN → ይጠቁማል፣ ተጠቃሚው VPN አጥፍቶ እንደገና ቢሞክር ሊሳካ ይችላል
     document.getElementById("ttl").textContent = "Warning";
     document.getElementById("sub").textContent = "VPN/Proxy Link Intercepted.";
     $pill.innerHTML =
@@ -263,7 +251,6 @@ function showErr(reason){
       "VPN <strong>Disconnect</strong> አድርገው በቦቱ በኩል በድጋሚ ይሞክሩ።";
 
   } else if(reason === "self_invite"){
-    // ራሱን ጋበዘ
     document.getElementById("ttl").textContent = "Banned";
     document.getElementById("sub").textContent = "Self-referral detected.";
     $pill.innerHTML =
@@ -271,7 +258,6 @@ function showErr(reason){
       "የራስዎን ሊንክ ተጠቅመዋል። ራስን መጋበዝ (Self-invite) በጥብቅ የተከለከለ ነው።";
 
   } else if(reason === "clone_of_referrer"){
-    // referrer ጋር ተመሳሳይ device — አንድ ስልክ ሁለት account
     document.getElementById("ttl").textContent = "Banned";
     document.getElementById("sub").textContent = "Device already registered.";
     $pill.innerHTML =
@@ -280,7 +266,6 @@ function showErr(reason){
       "Multi-account ስርዓት ማጭበርበር ነው — ክልክል ነው።";
 
   } else if(reason === "clone_of_existing"){
-    // ሌላ user ጋር ተመሳሳይ device
     document.getElementById("ttl").textContent = "Banned";
     document.getElementById("sub").textContent = "Hardware integrity violation.";
     $pill.innerHTML =
@@ -289,7 +274,6 @@ function showErr(reason){
       "ማጭበርበር በጥብቅ የተከለከለ ነው።";
 
   } else if(reason === "no_fingerprint"){
-    // Emulator ወይም automation tool
     document.getElementById("ttl").textContent = "Banned";
     document.getElementById("sub").textContent = "Emulator / Bot detected.";
     $pill.innerHTML =
@@ -298,7 +282,6 @@ function showErr(reason){
       "እውነተኛ ስልክ ብቻ ተቀባይነት አለው።";
 
   } else if(reason === "banned_ip"){
-    // IP banned ነው
     document.getElementById("ttl").textContent = "Banned";
     document.getElementById("sub").textContent = "Network access denied.";
     $pill.innerHTML =
@@ -307,7 +290,6 @@ function showErr(reason){
       "ለእርዳታ Admin ያግኙ።";
 
   } else {
-    // Unexpected / generic
     document.getElementById("ttl").textContent = "Blocked";
     document.getElementById("sub").textContent = "Security clearance rejected.";
     $pill.innerHTML =
@@ -320,7 +302,7 @@ function showErr(reason){
 
 function closeApp(ms){ setTimeout(() => tg?.close(), ms); }
 
-/* ── Fetch with timeout ───────────────────────── */
+/* ── Fetch helpers ────────────────────────────── */
 async function fetchGet(url, ms = 6000){
   const ctrl  = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ms);
@@ -346,12 +328,7 @@ async function fetchPost(url, body, ms = 12000){
   } catch(e){ clearTimeout(timer); throw e; }
 }
 
-/* ══════════════════════════════════════════════
-   STEP 1 — Network check
-   🔒 FIX: IP ን backend ላይ አናስተላልፍም — backend ራሱ ያወጣዋል።
-   ipify.org የምንጠቀምበት ምክንያት VPN hint ለማግኘት ብቻ ነው
-   (ከ timezone/locale ጋር ለማወዳደር)።
-══════════════════════════════════════════════ */
+/* ── STEP 1 — Network check ───────────────────── */
 async function getNetworkInfo(){
   activate(1); setBar(10);
   let externalIp = "unknown";
@@ -360,7 +337,6 @@ async function getNetworkInfo(){
     const d = await r.json();
     externalIp = (d.ip || "").trim() || "unknown";
   } catch{
-    // ለ connectivity ችግር ወይም VPN block — ምንም problem አይደለም
     externalIp = "unknown";
   }
   ok(1, "Secure Tunnel Connected");
@@ -368,15 +344,11 @@ async function getNetworkInfo(){
   return externalIp;
 }
 
-/* ══════════════════════════════════════════════
-   STEP 2 — Device Fingerprint
-   Bot.py ጋር ሙሉ በሙሉ ይዛዛማል (SHA-256 hash)
-══════════════════════════════════════════════ */
+/* ── STEP 2 — Device Fingerprint ─────────────── */
 async function getFingerprint(){
   activate(2); setBar(40);
   const P = [];
 
-  // Canvas fingerprint
   try{
     const c   = document.createElement("canvas");
     c.width   = 240; c.height = 60;
@@ -390,7 +362,6 @@ async function getFingerprint(){
     P.push("cv:" + c.toDataURL().slice(-80));
   } catch{ P.push("cv:x"); }
 
-  // WebGL fingerprint
   try{
     const cv = document.createElement("canvas");
     const gl = cv.getContext("webgl") || cv.getContext("experimental-webgl");
@@ -401,7 +372,6 @@ async function getFingerprint(){
     } else P.push("gl:x");
   } catch{ P.push("gl:x"); }
 
-  // Screen & device info
   P.push("sc:"   + screen.width + "x" + screen.height + "x" + screen.colorDepth);
   P.push("dpr:"  + (devicePixelRatio || 1));
 
@@ -413,7 +383,6 @@ async function getFingerprint(){
   P.push("lang:" + lang);
   P.push("ua:"   + navigator.userAgent);
 
-  // SHA-256 hash
   let fp = "";
   try{
     const raw = P.join("|||");
@@ -422,7 +391,6 @@ async function getFingerprint(){
     fp = Array.from(new Uint8Array(buf))
                .map(b => b.toString(16).padStart(2,"0")).join("");
   } catch{
-    // crypto.subtle fail ሲሆን (very old browser) → random fallback
     fp = "fallback_" + Math.random().toString(36).substring(2) + Date.now();
   }
 
@@ -431,39 +399,24 @@ async function getFingerprint(){
   return { fp, tz, lang };
 }
 
-/* ══════════════════════════════════════════════
-   VPN HINT — Client-side ብቻ (backend ዋናውን check ያደርጋል)
-   🔒 FIX: ቀደም ሲል "Amharic + non-ET timezone → VPN" ይላል ነበር።
-   ይህ ዲያስፖራ ተጠቃሚዎችን ያግዳቸዋል።
-
-   አዲሱ logic:
-   - ሁለት ሙሉ VPN indicators ካሉ ብቻ hint=true ይላካል
-   - backend proxycheck.io ዋናውን VPN detection ያደርጋል
-   - client hint ደጋፊ signal ብቻ ነው፣ ብቻውን ban አያደርግም
-══════════════════════════════════════════════ */
+/* ── VPN Hint — ✅ FIXED ──────────────────────
+   ቀድሞ: timezone UTC + lang "en" → VPN ይላል ነበር (ዲያስፖራ ያስቸገር ነበር)
+   አሁን: Tor browser ወይም hardwareConcurrency===0 (VM) ብቻ hint=true
+   ዋናው VPN detection backend proxycheck.io ላይ ነው።
+─────────────────────────────────────────────── */
 function detectClientVpnHint(externalIp, fpData){
-  const { tz, lang } = fpData;
-
-  // Tor exit node user agents (rare but possible)
+  // Tor Browser
   const uaLower = navigator.userAgent.toLowerCase();
   if(uaLower.includes("tor browser")) return true;
 
-  // timezone ሙሉ በሙሉ UTC ከሆነ + browser language "en" ብቻ ከሆነ
-  // (የፍጹም ኢትዮጵያዊ user ሁልጊዜ tz አለው) — weak signal ብቻ
-  const isUtcTz    = tz === "UTC" || tz === "Etc/UTC" || tz === "Etc/GMT";
-  const isEnOnly   = lang === "en" || lang === "en-US";
-  const noHardware = (navigator.hardwareConcurrency || 0) === 0; // VM indicator
+  // VM / Emulator — እውነተኛ ስልክ ሁልጊዜ hardwareConcurrency >= 1 አለው
+  if((navigator.hardwareConcurrency || 0) === 0) return true;
 
-  // ሁለት ወይም ከዚያ በላይ weak signals ካሉ ብቻ hint=true
-  const signals = [isUtcTz, isEnOnly, noHardware].filter(Boolean).length;
-  return signals >= 2;
+  // ሌላ ምንም → false (backend ዋናውን VPN check ያደርጋል)
+  return false;
 }
 
-/* ══════════════════════════════════════════════
-   STEP 3 — Submit to backend
-   🔒 FIX: IP ን frontend ኣንልክም — backend ራሱ ያወጣዋል።
-   ua ን ግን እንልካለን (backend ውስጥ save ይደረጋል)
-══════════════════════════════════════════════ */
+/* ── STEP 3 — Submit to backend ──────────────── */
 async function submit(externalIp, fpData){
   activate(3);
   document.getElementById("i3").textContent = "Authenticating…";
@@ -476,19 +429,16 @@ async function submit(externalIp, fpData){
     refId:       REF_ID,
     msgId:       MSG_ID,
     initData:    initData,
-    // 🔒 ip field ተወግዷል — backend extract_real_ip() ይጠቀማል
     ua:          navigator.userAgent,
     fingerprint: fpData.fp,
-    isVpn:       clientVpnHint   // helper hint ብቻ — backend ዋናውን ያረጋግጣል
+    isVpn:       clientVpnHint
   });
 
   if(!r.ok) throw new Error(`Server ${r.status}`);
   return await r.json();
 }
 
-/* ══════════════════════════════════════════════
-   Main Execution
-══════════════════════════════════════════════ */
+/* ── Main ─────────────────────────────────────── */
 (async () => {
   try{
     const externalIp = await getNetworkInfo();
@@ -506,8 +456,6 @@ async function submit(externalIp, fpData){
       err(3, "Rejected ✕");
       const reason = result.reason || "unknown";
       showErr(reason);
-      // VPN → 8s (ተጠቃሚው VPN ያጥፋ message ያነባል)
-      // ሌላ → 6s
       closeApp(reason === "vpn" ? 8000 : 6000);
 
     } else {
