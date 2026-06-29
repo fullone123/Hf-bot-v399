@@ -83,12 +83,16 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS verifications (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id     INTEGER UNIQUE,
-    ip_address  TEXT,
-    user_agent  TEXT,
-    fingerprint TEXT,
-    verified_at TEXT DEFAULT (datetime('now'))
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER UNIQUE,
+    ip_address      TEXT,
+    user_agent      TEXT,
+    fingerprint     TEXT,
+    referrer_ip     TEXT    DEFAULT '',
+    tg_platform     TEXT    DEFAULT '',
+    tg_version      TEXT    DEFAULT '',
+    tg_app_version  TEXT    DEFAULT '',
+    verified_at     TEXT    DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS withdrawals (
@@ -136,6 +140,16 @@ SELECT user_id FROM verifications;
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SCHEMA MIGRATION — existing DB ላይ አዲስ columns ይጨምር (safe)
+# ─────────────────────────────────────────────────────────────────────────────
+MIGRATION_STATEMENTS = [
+    "ALTER TABLE verifications ADD COLUMN referrer_ip    TEXT DEFAULT ''",
+    "ALTER TABLE verifications ADD COLUMN tg_platform    TEXT DEFAULT ''",
+    "ALTER TABLE verifications ADD COLUMN tg_version     TEXT DEFAULT ''",
+    "ALTER TABLE verifications ADD COLUMN tg_app_version TEXT DEFAULT ''",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DATA ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 class DataEngine:
@@ -144,6 +158,13 @@ class DataEngine:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.executescript(SCHEMA)
             await db.commit()
+            # Migration: existing DB ላይ አዲስ columns ይጨምር
+            for stmt in MIGRATION_STATEMENTS:
+                try:
+                    await db.execute(stmt)
+                    await db.commit()
+                except Exception:
+                    pass  # Column already exists — ignore
 
     @staticmethod
     async def get_user(user_id: int):
@@ -206,8 +227,10 @@ class DataEngine:
     async def inject_fake_verification(user_id: int):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "INSERT OR REPLACE INTO verifications (user_id, ip_address, user_agent, fingerprint) VALUES (?,?,?,?)",
-                (user_id, "BYPASS_ADMIN", "BYPASS_ADMIN", f"BYPASS_{user_id}"),
+                "INSERT OR REPLACE INTO verifications "
+                "(user_id, ip_address, user_agent, fingerprint, referrer_ip, tg_platform, tg_version, tg_app_version) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (user_id, "BYPASS_ADMIN", "BYPASS_ADMIN", f"BYPASS_{user_id}", "", "", "", ""),
             )
             await db.commit()
 
@@ -218,11 +241,22 @@ class DataEngine:
             return (await cur.fetchone()) is not None
 
     @staticmethod
-    async def save_verification(user_id: int, ip: str, ua: str, fingerprint: str):
+    async def save_verification(
+        user_id: int,
+        ip: str,
+        ua: str,
+        fingerprint: str,
+        referrer_ip: str = "",
+        tg_platform: str = "",
+        tg_version: str = "",
+        tg_app_version: str = "",
+    ):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "INSERT OR REPLACE INTO verifications (user_id, ip_address, user_agent, fingerprint) VALUES (?,?,?,?)",
-                (user_id, ip, ua, fingerprint),
+                "INSERT OR REPLACE INTO verifications "
+                "(user_id, ip_address, user_agent, fingerprint, referrer_ip, tg_platform, tg_version, tg_app_version) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (user_id, ip, ua, fingerprint, referrer_ip, tg_platform, tg_version, tg_app_version),
             )
             await db.commit()
 
@@ -341,11 +375,48 @@ async def evaluate_clone_risk(
     referrer_id: int,
     client_ip: str,
     fingerprint: str,
+    tg_platform: str = "",
+    tg_version: str  = "",
 ) -> tuple[bool, str]:
+
+    # ── 1. ራስን መጋበዝ ─────────────────────────────────────────
     if referrer_id and referrer_id == new_user_id:
         return True, "self_invite"
 
     ip_is_checkable = client_ip and client_ip not in ("127.0.0.1", "::1", "unknown")
+
+    # ── 2. NEW: Inviter IP match — ጋባዠ እና አዲሱ user ተመሳሳይ IP ──
+    #    ሰው ሁለት ስልክ ቢኖረው ግን አንድ WiFi ላይ ቢጠቀም ሊታገድ ይችላል።
+    #    ስለዚህ IP match ብቻ ሳይሆን fingerprint ተጨምሮ ይፈተሻል።
+    if ip_is_checkable and referrer_id:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT ip_address, fingerprint FROM verifications WHERE user_id = ?",
+                (referrer_id,)
+            )
+            inv_row = await cur.fetchone()
+            if inv_row:
+                inv_ip = inv_row["ip_address"] or ""
+                inv_fp = inv_row["fingerprint"] or ""
+                if (
+                    inv_ip not in ("", "127.0.0.1", "::1", "unknown", "BYPASS_ADMIN")
+                    and inv_ip == client_ip
+                ):
+                    # IP ተመሳሳይ ነው — fingerprint ተጨምሮ ይፈትሽ
+                    if fingerprint and inv_fp and inv_fp == fingerprint:
+                        # ሙሉ match = ራሱ ነው
+                        return True, "same_device_as_referrer"
+                    elif fingerprint and inv_fp and inv_fp != fingerprint:
+                        # IP ተመሳሳይ ግን device ተለየ = ቤት WiFi ሊሆን ይችላል
+                        # ሁለቱ አካውንት ለ 24hr ካርክ ሳይሆን ተፈቅዷል — ሆኖም log ያድርግ
+                        logger.warning(
+                            f"Same IP different device: ref={referrer_id} new={new_user_id} "
+                            f"ip={client_ip} — allowing (different fingerprint)"
+                        )
+                    else:
+                        # fingerprint ሌለ — IP ብቻ match = ጠያቂ
+                        return True, "same_ip_as_referrer"
 
     if not ip_is_checkable or not fingerprint:
         return False, ""
@@ -353,41 +424,47 @@ async def evaluate_clone_risk(
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
+        # ── 3. Fingerprint + IP = referrer device clone ──────────
         if referrer_id:
             cur = await db.execute(
-                "SELECT user_id FROM verifications WHERE user_id = ? AND ip_address = ? AND fingerprint = ?",
+                "SELECT user_id FROM verifications "
+                "WHERE user_id = ? AND ip_address = ? AND fingerprint = ?",
                 (referrer_id, client_ip, fingerprint),
             )
             if await cur.fetchone():
                 return True, "clone_of_referrer"
 
+        # ── 4. Fingerprint + IP = any existing user clone ────────
         cur = await db.execute(
-            "SELECT user_id FROM verifications WHERE ip_address = ? AND fingerprint = ? AND user_id != ? LIMIT 1",
+            "SELECT user_id FROM verifications "
+            "WHERE ip_address = ? AND fingerprint = ? AND user_id != ? LIMIT 1",
             (client_ip, fingerprint, new_user_id),
         )
         if await cur.fetchone():
             return True, "clone_of_existing"
 
+        # ── 5. NEW: Telegram device clone (platform+version+fingerprint) ──
+        #    አንድ ስልክ ላይ ሁለት አካውንት ቢያስነሳ ይይዛል
+        if tg_platform and tg_version and fingerprint:
+            cur = await db.execute(
+                "SELECT user_id FROM verifications "
+                "WHERE tg_platform = ? AND tg_version = ? AND fingerprint = ? "
+                "AND user_id != ? LIMIT 1",
+                (tg_platform, tg_version, fingerprint, new_user_id),
+            )
+            existing = await cur.fetchone()
+            if existing:
+                logger.warning(
+                    f"TG device clone: uid={new_user_id} "
+                    f"matches uid={existing['user_id']} "
+                    f"platform={tg_platform} version={tg_version}"
+                )
+                return True, "clone_tg_device"
+
     return False, ""
 
 
 def extract_real_ip(request: Request) -> str:
-    """
-    ✅ FIX #4: Real client IP ማውጣት።
-
-    ቀደም ሲል parts[-1] (የመጨረሻው) ይወሰድ ነበር። ይህ ስህተት ነው — X-Forwarded-For
-    ስታንዳርድ ቅርፅ: "client_ip, proxy1, proxy2, ..." ነው፣ ማለትም **የመጀመሪያው
-    (leftmost)** ነው ዋናው ተጠቃሚ (client) አድራሻ። የመጨረሻው ብዙ ጊዜ Render/Railway/
-    Cloudflare's የራሳቸው internal edge IP ነው (ራሱ datacenter ስለሆነ proxycheck
-    ሁልጊዜ "Hosting/Proxy" ብሎ ይፈርጀዋል — ስለዚህ ቦቱ የተጠቃሚውን ስልክ ሳይሆን
-    የራሱን ሆስቲንግ ፕላትፎርም IP እያረካ ነበር፣ ለዚህም ነው VPN ባልጠቀመም ሁሌ የሚታገድው)።
-
-    ቅድሚያ የሚሰጠው፦
-    1. CF-Connecting-IP (Cloudflare የሚያስቀምጠው ትክክለኛ client IP)
-    2. X-Real-IP
-    3. X-Forwarded-For ውስጥ የመጀመሪያው (leftmost) entry
-    4. request.client.host (fallback)
-    """
     cf_ip = request.headers.get("CF-Connecting-IP", "").strip()
     if cf_ip:
         return cf_ip
@@ -400,7 +477,7 @@ def extract_real_ip(request: Request) -> str:
     if forwarded:
         parts = [p.strip() for p in forwarded.split(",") if p.strip()]
         if parts:
-            return parts[0]  # leftmost = original client, NOT parts[-1]
+            return parts[0]
 
     if request.client:
         return request.client.host
@@ -643,26 +720,7 @@ def parse_telegram_webapp_handshake(init_data: str) -> dict | None:
         return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ✅ FIX #3: VPN CHECK — block ONLY on a definitive VPN/TOR `type` match.
-# proxycheck.io's v2 `type` field is unstable for shared/CGNAT mobile-carrier
-# IPs (very common in Ethiopia — Ethio Telecom etc. share one public IP
-# across thousands of subscribers). If any other subscriber on that shared
-# IP triggered abuse history, proxycheck can label the *whole IP* as
-# "Compromised" / "Hosting" / etc — even though no VPN is involved.
-# The previous version blocked on "anything that isn't explicitly
-# Mobile/Residential", which caught these innocent shared IPs.
-# Now: block ONLY when type is unambiguously VPN or TOR, or when proxycheck
-# names a known VPN operator. Everything else passes through.
-# ─────────────────────────────────────────────────────────────────────────────
 async def execute_network_vpn_lookup(client_ip: str) -> bool:
-    """
-    proxycheck.io ን ይጠቀማል።
-    ብቸኛ ማገጃ ምክንያት፦ type == VPN ወይም TOR ሲሆን ብቻ (named operator ካለ ተጨማሪ ማረጋገጫ)።
-    ሌላ ምንም ዓይነት (Hosting/Compromised/ባዶ/ወዘተ) አያግድም — ምክንያቱም በኢትዮጵያ
-    Mobile Carrier (Ethio Telecom) shared/CGNAT IP ላይ ሌላ ሰው ጥፋት ቢሰራ
-    proxycheck ሙሉውን IP range ይህን ስም ይሰጠዋል፣ ይህም VPN ማለት አይደለም።
-    """
     if not client_ip or client_ip in ("127.0.0.1", "::1", "unknown"):
         return False
     try:
@@ -674,22 +732,18 @@ async def execute_network_vpn_lookup(client_ip: str) -> bool:
             d = payload.get(client_ip, {})
 
             ptype    = (d.get("type") or "").upper()
-            operator = d.get("operator")  # dict present only for named VPN providers
+            operator = d.get("operator")
 
             logger.info(f"proxycheck result ip={client_ip} raw={d}")
 
-            # Definite, unambiguous VPN/TOR classification only.
             if ptype in ("VPN", "TOR"):
                 return True
 
-            # A recognised commercial VPN operator name is a strong signal
-            # even if `type` itself came back as something generic.
             if operator and isinstance(operator, dict) and operator.get("name"):
                 return True
 
             return False
     except Exception:
-        # API ካልሰራ fail-open (አያግድም)። fail-closed ቢፈልጉ "return True" ያድርጉ።
         logger.warning(f"proxycheck lookup failed for ip={client_ip}")
         return False
 
@@ -1275,6 +1329,10 @@ async def process_search_execute(message: Message, state: FSMContext):
     direct, tier2 = await DataEngine.get_referral_metrics(target)
     verif   = await DataEngine.get_verification(target)
     ip_info = f"<code>{verif['ip_address']}</code>" if verif else "Not verified"
+    # NEW: referrer_ip ያሳይ
+    ref_ip_info = f"<code>{verif['referrer_ip']}</code>" if (verif and verif['referrer_ip']) else "N/A"
+    tg_plat  = (verif['tg_platform']    or "N/A") if verif else "N/A"
+    tg_ver   = (verif['tg_version']     or "N/A") if verif else "N/A"
     await message.answer(
         f"👤 <b>User Profile:</b>\n\n"
         f"• Name: {user['full_name']}\n"
@@ -1284,6 +1342,9 @@ async def process_search_execute(message: Message, state: FSMContext):
         f"• Tier-2 Network: <b>{tier2}</b>\n"
         f"• Banned: <b>{'Yes' if user['is_banned'] else 'No'}</b>\n"
         f"• IP Address: {ip_info}\n"
+        f"• Referrer IP: {ref_ip_info}\n"
+        f"• TG Platform: <b>{tg_plat}</b>\n"
+        f"• TG Version: <b>{tg_ver}</b>\n"
         f"• Joined: {user['joined_at']}",
         reply_markup=generate_admin_dashboard()
     )
@@ -1510,9 +1571,7 @@ async def serve_frontend(uid: int = 0, ref: int = 0, msg_id: int = 0):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ✅ FIX: VERIFICATION ENDPOINT
-# isVpn client hint ሙሉ በሙሉ ተሰርዟል — backend ብቻ ይወስናል
-# proxycheck.io: type field (VPN/TOR) ላይ ይተማመናል — risk score ላይ አይደለም
+# FASTAPI — VERIFICATION ENDPOINT
 # ─────────────────────────────────────────────────────────────────────────────
 @api_platform.post("/api/verify")
 async def execute_verification(request: Request):
@@ -1524,6 +1583,11 @@ async def execute_verification(request: Request):
     uid    = int(tg_user["id"])
     ref_id = int(data.get("refId") or 0)
     msg_id = int(data.get("msgId") or 0)
+
+    # ── NEW: Telegram Mini App platform/version info ──────────────
+    tg_platform    = str(data.get("tgPlatform", "")).strip()[:50]     # "android","ios","tdesktop","web","weba"
+    tg_version     = str(data.get("tgVersion", "")).strip()[:30]      # Telegram app version
+    tg_app_version = str(data.get("tgAppVersion", "")).strip()[:30]   # WebApp version
 
     if await DataEngine.is_verified(uid):
         return JSONResponse({"status": "already_verified"})
@@ -1540,6 +1604,7 @@ async def execute_verification(request: Request):
     client_ip = extract_real_ip(request)
     logger.info(
         f"verify: uid={uid} resolved_ip={client_ip} "
+        f"tg_platform={tg_platform} tg_version={tg_version} "
         f"xff={request.headers.get('X-Forwarded-For')} "
         f"cf_ip={request.headers.get('CF-Connecting-IP')} "
         f"x_real_ip={request.headers.get('X-Real-IP')}"
@@ -1550,19 +1615,21 @@ async def execute_verification(request: Request):
         await DataEngine.ban_user(uid, 1)
         return JSONResponse({"status": "blocked", "reason": "banned_ip"})
 
-    should_ban, ban_reason = await evaluate_clone_risk(uid, ref_id, client_ip, fingerprint)
+    # ── Clone risk evaluation (IP + fingerprint + Telegram device) ──
+    should_ban, ban_reason = await evaluate_clone_risk(
+        uid, ref_id, client_ip, fingerprint,
+        tg_platform=tg_platform,
+        tg_version=tg_version,
+    )
     if should_ban:
         await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
         await DataEngine.ban_user(uid, 1)
         if msg_id > 0:
             try: await bot.delete_message(chat_id=uid, message_id=msg_id)
             except Exception: pass
-        logger.warning(f"Clone detected: uid={uid} reason={ban_reason} ip={client_ip}")
+        logger.warning(f"Clone detected: uid={uid} reason={ban_reason} ip={client_ip} platform={tg_platform}")
         return JSONResponse({"status": "blocked", "reason": ban_reason})
 
-    # ✅ FIX: client isVpn hint ሙሉ በሙሉ ተሰርዟል
-    # backend proxycheck.io ብቻ ይወስናል (type field == VPN/TOR, ወይም
-    # proxy=yes እና type Mobile/Residential ካልሆነ)
     is_vpn = await execute_network_vpn_lookup(client_ip)
     if is_vpn:
         await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
@@ -1572,8 +1639,21 @@ async def execute_verification(request: Request):
         try: await bot.delete_message(chat_id=uid, message_id=msg_id)
         except Exception: pass
 
+    # ── NEW: referrer IP ይወሰድ ──────────────────────────────────────
+    referrer_ip = ""
+    if ref_id and ref_id != uid:
+        ref_verif = await DataEngine.get_verification(ref_id)
+        if ref_verif and ref_verif["ip_address"] not in ("", "BYPASS_ADMIN"):
+            referrer_ip = ref_verif["ip_address"]
+
     await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""), ref_id or None)
-    await DataEngine.save_verification(uid, client_ip, data.get("ua", ""), fingerprint)
+    await DataEngine.save_verification(
+        uid, client_ip, data.get("ua", ""), fingerprint,
+        referrer_ip=referrer_ip,
+        tg_platform=tg_platform,
+        tg_version=tg_version,
+        tg_app_version=tg_app_version,
+    )
 
     if ref_id and ref_id != uid:
         bounty = float(await DataEngine.get_setting("reward_per_referral", "10"))
