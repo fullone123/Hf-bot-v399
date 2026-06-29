@@ -392,6 +392,61 @@ async def process_channel_revalidation(callback: CallbackQuery, state: FSMContex
         await sent.edit_reply_markup(reply_markup=generate_verification_widget(uid, ref, sent.message_id))
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 🟢 FIX: CORE TELEGRAM BOT HANDLERS — these were completely missing from the
+# code, which is why the bot never responded to /start or any main-menu button.
+# ─────────────────────────────────────────────────────────────────────────────
+@core_router.message(CommandStart())
+async def process_start_command(message: Message, state: FSMContext):
+    await state.clear()
+    uid  = message.from_user.id
+    args = message.text.split()
+    arg  = args[1] if len(args) > 1 else ""
+    ref  = int(arg) if arg.isdigit() and int(arg) != uid else 0
+
+    acc = await DataEngine.get_user(uid)
+    if acc and acc["is_banned"]:
+        return await message.answer("🚫 <b>Banned:</b> Your profile has been blacklisted.")
+
+    if not await enforce_membership_gate(message, uid):
+        if ref: await state.update_data(stashed_referrer_id=ref)
+        return
+
+    if await DataEngine.is_verified(uid):
+        return await message.answer("✅ <b>Welcome back!</b> Access granted.", reply_markup=generate_dashboard_matrix(uid))
+
+    sent = await message.answer(f"{BOT_RULES_CAPTION}\n\n🔐 <b>Next Step:</b> Verify identity via Mini App:", reply_markup=generate_verification_widget(uid, ref, 0))
+    await sent.edit_reply_markup(reply_markup=generate_verification_widget(uid, ref, sent.message_id))
+
+@core_router.callback_query(F.data == "ui_return_home")
+async def process_navigation_home(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if not await enforce_membership_gate(callback, callback.from_user.id): return
+    await callback.message.edit_text("🏠 <b>Main Dashboard Menu / ዋና ማውጫ</b>", reply_markup=generate_dashboard_matrix(callback.from_user.id))
+
+@core_router.callback_query(F.data == "ui_fetch_balance")
+async def process_balance_query(callback: CallbackQuery):
+    if not await enforce_membership_gate(callback, callback.from_user.id): return
+    acc   = await DataEngine.get_user(callback.from_user.id)
+    min_w = await DataEngine.get_setting("min_withdrawal", "50")
+    await callback.message.edit_text(f"💰 <b>Your Available Balance:</b>\n\n• Assets: <code>{float(acc['balance']):.2f} Birr</code>\n• Minimum Withdrawal: <code>{min_w} Birr</code>", reply_markup=generate_fallback_navigation())
+
+@core_router.callback_query(F.data == "ui_fetch_referrals")
+async def process_referral_query(callback: CallbackQuery):
+    if not await enforce_membership_gate(callback, callback.from_user.id): return
+    uid  = callback.from_user.id
+    direct, _ = await DataEngine.get_referral_metrics(uid)
+    rate = float(await DataEngine.get_setting("reward_per_referral", "10"))
+    me   = await bot.get_me()
+    link = f"https://t.me/{me.username}?start={uid}"
+    await callback.message.edit_text(f"👥 <b>Your Referral Network:</b>\n\n• Total Referrals: <b>{direct} users</b>\n• Earnings per Referral: <b>{rate:.2f} Birr</b>\n• Total Earned: <b>{direct * rate:.2f} Birr</b>\n\n🔗 Your link:\n<code>{link}</code>", reply_markup=generate_fallback_navigation())
+
+@core_router.callback_query(F.data == "ui_fetch_link")
+async def process_link_generation(callback: CallbackQuery):
+    if not await enforce_membership_gate(callback, callback.from_user.id): return
+    me = await bot.get_me()
+    await callback.message.edit_text(f"🔗 <b>Your Invite Link:</b>\n\n<code>https://t.me/{me.username}?start={callback.from_user.id}</code>", reply_markup=generate_fallback_navigation())
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def evaluate_admin_access(user_id: int) -> bool:
