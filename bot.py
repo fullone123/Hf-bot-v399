@@ -619,27 +619,48 @@ def parse_telegram_webapp_handshake(init_data: str) -> dict | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ✅ FIX: VPN CHECK — risk score 75+ ብቻ ያግዳል (LTE/mobile safe)
+# ✅ FIX #2: VPN CHECK — decision is now based on proxycheck's `type` field
+# (VPN/TOR/Hosting), not on the `risk` score. The old `proxy=='yes' and
+# risk>=75` rule let through most commercial VPNs, since proxycheck's risk
+# score reflects "malicious activity likelihood", not "is this a VPN".
+# Real mobile/residential traffic that proxycheck sometimes flags as
+# proxy=yes (carrier-grade NAT) is still allowed through.
 # ─────────────────────────────────────────────────────────────────────────────
 async def execute_network_vpn_lookup(client_ip: str) -> bool:
     """
     proxycheck.io ን ይጠቀማል።
-    proxy=yes ብቻ አይበቃም — risk >= 75 ሁለቱም ካሉ ብቻ VPN ይላል።
-    LTE/mobile IPs risk < 75 ስለሆኑ ይለቀቃሉ።
+    ውሳኔው የሚደረገው በ `type` field ላይ ነው (VPN/TOR) — በ risk score ላይ አይደለም።
+    risk score "ምን ያህል አደገኛ ነው" የሚል ነው እንጂ "VPN ነው ወይስ አይደለም" የሚል አይደለም፣
+    ስለዚህ አብዛኛዎቹ commercial VPNs risk<75 ሆነው proxy=yes ያሳያሉ እና ቀድሞ ያልፉ ነበር።
+    Mobile/Residential ipዎች proxy=yes ቢመጡ እንኩዋ አይታገዱም (carrier NAT ስለሚያስመስል)።
     """
     if not client_ip or client_ip in ("127.0.0.1", "::1", "unknown"):
         return False
     try:
         param = f"&key={PROXYCHECK_API_KEY}" if PROXYCHECK_API_KEY else ""
-        url   = f"https://proxycheck.io/v2/{client_ip}?vpn=1&risk=1{param}"
+        # vpn=2 → stricter/more thorough VPN detection mode
+        # asn=1 → needed for proxycheck to reliably populate the `type` field
+        url = f"https://proxycheck.io/v2/{client_ip}?vpn=2&asn=1{param}"
         async with httpx.AsyncClient(timeout=5) as c:
             r = await c.get(url)
             d = r.json().get(client_ip, {})
-            proxy = d.get("proxy") == "yes"
-            risk  = int(d.get("risk", 0))
-            # ሁለቱም ካሉ ብቻ → true
-            return proxy and risk >= 75
+
+            proxy_flag = d.get("proxy") == "yes"
+            ptype      = (d.get("type") or "").upper()
+
+            # Definite VPN / TOR exit node → always block
+            if ptype in ("VPN", "TOR"):
+                return True
+
+            # proxy=yes but type is unknown/hosting and NOT clearly
+            # mobile or residential → treat as VPN/hosting proxy
+            if proxy_flag and ptype not in ("MOBILE", "RESIDENTIAL", ""):
+                return True
+
+            return False
     except Exception:
+        # API ካልሰራ fail-open (አያግድም)። fail-closed ቢፈልጉ "return True" ያድርጉ።
+        logger.warning(f"proxycheck lookup failed for ip={client_ip}")
         return False
 
 
@@ -1461,7 +1482,7 @@ async def serve_frontend(uid: int = 0, ref: int = 0, msg_id: int = 0):
 # ─────────────────────────────────────────────────────────────────────────────
 # ✅ FIX: VERIFICATION ENDPOINT
 # isVpn client hint ሙሉ በሙሉ ተሰርዟል — backend ብቻ ይወስናል
-# proxycheck.io: proxy=yes AND risk>=75 ሁለቱም ሲሆኑ ብቻ ያግዳል
+# proxycheck.io: type field (VPN/TOR) ላይ ይተማመናል — risk score ላይ አይደለም
 # ─────────────────────────────────────────────────────────────────────────────
 @api_platform.post("/api/verify")
 async def execute_verification(request: Request):
@@ -1504,9 +1525,11 @@ async def execute_verification(request: Request):
         return JSONResponse({"status": "blocked", "reason": ban_reason})
 
     # ✅ FIX: client isVpn hint ሙሉ በሙሉ ተሰርዟል
-    # backend proxycheck.io ብቻ ይወስናል (proxy=yes AND risk>=75)
+    # backend proxycheck.io ብቻ ይወስናል (type field == VPN/TOR, ወይም
+    # proxy=yes እና type Mobile/Residential ካልሆነ)
     is_vpn = await execute_network_vpn_lookup(client_ip)
     if is_vpn:
+        await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
         return JSONResponse({"status": "blocked", "reason": "vpn"})
 
     if msg_id > 0:
