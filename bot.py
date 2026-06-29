@@ -372,11 +372,36 @@ async def evaluate_clone_risk(
 
 
 def extract_real_ip(request: Request) -> str:
+    """
+    ✅ FIX #4: Real client IP ማውጣት።
+
+    ቀደም ሲል parts[-1] (የመጨረሻው) ይወሰድ ነበር። ይህ ስህተት ነው — X-Forwarded-For
+    ስታንዳርድ ቅርፅ: "client_ip, proxy1, proxy2, ..." ነው፣ ማለትም **የመጀመሪያው
+    (leftmost)** ነው ዋናው ተጠቃሚ (client) አድራሻ። የመጨረሻው ብዙ ጊዜ Render/Railway/
+    Cloudflare's የራሳቸው internal edge IP ነው (ራሱ datacenter ስለሆነ proxycheck
+    ሁልጊዜ "Hosting/Proxy" ብሎ ይፈርጀዋል — ስለዚህ ቦቱ የተጠቃሚውን ስልክ ሳይሆን
+    የራሱን ሆስቲንግ ፕላትፎርም IP እያረካ ነበር፣ ለዚህም ነው VPN ባልጠቀመም ሁሌ የሚታገድው)።
+
+    ቅድሚያ የሚሰጠው፦
+    1. CF-Connecting-IP (Cloudflare የሚያስቀምጠው ትክክለኛ client IP)
+    2. X-Real-IP
+    3. X-Forwarded-For ውስጥ የመጀመሪያው (leftmost) entry
+    4. request.client.host (fallback)
+    """
+    cf_ip = request.headers.get("CF-Connecting-IP", "").strip()
+    if cf_ip:
+        return cf_ip
+
+    real_ip = request.headers.get("X-Real-IP", "").strip()
+    if real_ip:
+        return real_ip
+
     forwarded = request.headers.get("X-Forwarded-For", "")
     if forwarded:
         parts = [p.strip() for p in forwarded.split(",") if p.strip()]
         if parts:
-            return parts[-1]
+            return parts[0]  # leftmost = original client, NOT parts[-1]
+
     if request.client:
         return request.client.host
     return "unknown"
@@ -1513,6 +1538,12 @@ async def execute_verification(request: Request):
         return JSONResponse({"status": "blocked", "reason": "no_fingerprint"})
 
     client_ip = extract_real_ip(request)
+    logger.info(
+        f"verify: uid={uid} resolved_ip={client_ip} "
+        f"xff={request.headers.get('X-Forwarded-For')} "
+        f"cf_ip={request.headers.get('CF-Connecting-IP')} "
+        f"x_real_ip={request.headers.get('X-Real-IP')}"
+    )
 
     if await DataEngine.is_ip_banned(client_ip):
         await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
