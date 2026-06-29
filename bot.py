@@ -120,8 +120,22 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT
 );
 
+-- 🟢 FIX: Tracks which users have already been SHOWN the fake/view-only
+-- "no admin needed" force-join channels. Once a user has seen them once,
+-- they are never shown again — unlike real force-join channels, which are
+-- re-checked and re-enforced every single time.
+CREATE TABLE IF NOT EXISTS fake_join_seen (
+    user_id INTEGER PRIMARY KEY,
+    seen_at TEXT DEFAULT (datetime('now'))
+);
+
 INSERT OR IGNORE INTO settings (key, value) VALUES ('reward_per_referral', '10');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdrawal', '50');
+
+-- Backfill: anyone already verified before this update existed should not
+-- suddenly see the fake channels pop up again on their next /start.
+INSERT OR IGNORE INTO fake_join_seen (user_id)
+SELECT user_id FROM verifications;
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,6 +281,18 @@ class DataEngine:
             return await cur.fetchall()
 
     @staticmethod
+    async def has_seen_fake_join(user_id: int) -> bool:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT user_id FROM fake_join_seen WHERE user_id = ?", (user_id,))
+            return (await cur.fetchone()) is not None
+
+    @staticmethod
+    async def mark_fake_join_seen(user_id: int):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR IGNORE INTO fake_join_seen (user_id) VALUES (?)", (user_id,))
+            await db.commit()
+
+    @staticmethod
     async def get_setting(key: str, default=None):
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -330,20 +356,32 @@ async def inspect_compulsory_memberships(user_id: int) -> list:
     return unjoined
 
 async def enforce_membership_gate(event, user_id: int) -> bool:
+    # Real force-join channels are ALWAYS checked, every single time — if the
+    # user has left one, they get blocked and forced to rejoin it.
     unjoined = await inspect_compulsory_memberships(user_id)
 
     is_callback = isinstance(event, CallbackQuery)
     current_data = event.data if is_callback else ""
 
+    # 🟢 FIX: Fake/view-only channels are only ever added to the gate ONCE
+    # per user. After they've been shown a single time, they never appear
+    # again and are never checked — unlike real channels above.
     if not is_callback or current_data in ("ui_return_home", ""):
-        all_channels = await DataEngine.get_force_channels()
-        for ch in all_channels:
-            if ch["bot_added"] == 1:
-                if not any(x['channel_id'] == ch['channel_id'] for x in unjoined):
-                    unjoined.append(dict(ch))
+        already_seen_fake = await DataEngine.has_seen_fake_join(user_id)
+        if not already_seen_fake:
+            all_channels = await DataEngine.get_force_channels()
+            for ch in all_channels:
+                if ch["bot_added"] == 1:
+                    if not any(x['channel_id'] == ch['channel_id'] for x in unjoined):
+                        unjoined.append(dict(ch))
 
     if not unjoined:
         return True
+
+    # The moment fake channels are about to be displayed, mark them as seen
+    # immediately — "view once is enough", no confirmation click required.
+    if any(x.get('bot_added') == 1 for x in unjoined):
+        await DataEngine.mark_fake_join_seen(user_id)
 
     buttons = []
     for ch in unjoined:
