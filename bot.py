@@ -619,42 +619,47 @@ def parse_telegram_webapp_handshake(init_data: str) -> dict | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ✅ FIX #2: VPN CHECK — decision is now based on proxycheck's `type` field
-# (VPN/TOR/Hosting), not on the `risk` score. The old `proxy=='yes' and
-# risk>=75` rule let through most commercial VPNs, since proxycheck's risk
-# score reflects "malicious activity likelihood", not "is this a VPN".
-# Real mobile/residential traffic that proxycheck sometimes flags as
-# proxy=yes (carrier-grade NAT) is still allowed through.
+# ✅ FIX #3: VPN CHECK — block ONLY on a definitive VPN/TOR `type` match.
+# proxycheck.io's v2 `type` field is unstable for shared/CGNAT mobile-carrier
+# IPs (very common in Ethiopia — Ethio Telecom etc. share one public IP
+# across thousands of subscribers). If any other subscriber on that shared
+# IP triggered abuse history, proxycheck can label the *whole IP* as
+# "Compromised" / "Hosting" / etc — even though no VPN is involved.
+# The previous version blocked on "anything that isn't explicitly
+# Mobile/Residential", which caught these innocent shared IPs.
+# Now: block ONLY when type is unambiguously VPN or TOR, or when proxycheck
+# names a known VPN operator. Everything else passes through.
 # ─────────────────────────────────────────────────────────────────────────────
 async def execute_network_vpn_lookup(client_ip: str) -> bool:
     """
     proxycheck.io ን ይጠቀማል።
-    ውሳኔው የሚደረገው በ `type` field ላይ ነው (VPN/TOR) — በ risk score ላይ አይደለም።
-    risk score "ምን ያህል አደገኛ ነው" የሚል ነው እንጂ "VPN ነው ወይስ አይደለም" የሚል አይደለም፣
-    ስለዚህ አብዛኛዎቹ commercial VPNs risk<75 ሆነው proxy=yes ያሳያሉ እና ቀድሞ ያልፉ ነበር።
-    Mobile/Residential ipዎች proxy=yes ቢመጡ እንኩዋ አይታገዱም (carrier NAT ስለሚያስመስል)።
+    ብቸኛ ማገጃ ምክንያት፦ type == VPN ወይም TOR ሲሆን ብቻ (named operator ካለ ተጨማሪ ማረጋገጫ)።
+    ሌላ ምንም ዓይነት (Hosting/Compromised/ባዶ/ወዘተ) አያግድም — ምክንያቱም በኢትዮጵያ
+    Mobile Carrier (Ethio Telecom) shared/CGNAT IP ላይ ሌላ ሰው ጥፋት ቢሰራ
+    proxycheck ሙሉውን IP range ይህን ስም ይሰጠዋል፣ ይህም VPN ማለት አይደለም።
     """
     if not client_ip or client_ip in ("127.0.0.1", "::1", "unknown"):
         return False
     try:
         param = f"&key={PROXYCHECK_API_KEY}" if PROXYCHECK_API_KEY else ""
-        # vpn=2 → stricter/more thorough VPN detection mode
-        # asn=1 → needed for proxycheck to reliably populate the `type` field
-        url = f"https://proxycheck.io/v2/{client_ip}?vpn=2&asn=1{param}"
+        url = f"https://proxycheck.io/v2/{client_ip}?vpn=1&asn=1{param}"
         async with httpx.AsyncClient(timeout=5) as c:
             r = await c.get(url)
-            d = r.json().get(client_ip, {})
+            payload = r.json()
+            d = payload.get(client_ip, {})
 
-            proxy_flag = d.get("proxy") == "yes"
-            ptype      = (d.get("type") or "").upper()
+            ptype    = (d.get("type") or "").upper()
+            operator = d.get("operator")  # dict present only for named VPN providers
 
-            # Definite VPN / TOR exit node → always block
+            logger.info(f"proxycheck result ip={client_ip} raw={d}")
+
+            # Definite, unambiguous VPN/TOR classification only.
             if ptype in ("VPN", "TOR"):
                 return True
 
-            # proxy=yes but type is unknown/hosting and NOT clearly
-            # mobile or residential → treat as VPN/hosting proxy
-            if proxy_flag and ptype not in ("MOBILE", "RESIDENTIAL", ""):
+            # A recognised commercial VPN operator name is a strong signal
+            # even if `type` itself came back as something generic.
+            if operator and isinstance(operator, dict) and operator.get("name"):
                 return True
 
             return False
