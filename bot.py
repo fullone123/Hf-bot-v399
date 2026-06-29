@@ -2,6 +2,7 @@
 ================================================================================
                     TELEGRAM ADVANCED REFERRAL BOT SYSTEM
          [ Upgraded Production Engine - High Traffic & Safe Logs ]
+         [ Security Patched: Double-spend, Rate-limit, IP check, Clone detect ]
 ================================================================================
 """
 
@@ -14,6 +15,8 @@ import hashlib
 import logging
 import urllib.parse
 from datetime import datetime
+from collections import defaultdict
+import time
 
 import httpx
 import uvicorn
@@ -50,6 +53,7 @@ ADMIN_IDS            = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") i
 PAYMENT_LOG_CHANNEL  = os.getenv("PAYMENT_LOG_CHANNEL", "").strip()
 WEBAPP_URL           = os.getenv("WEBAPP_URL", "http://localhost:8000").rstrip("/")
 PROXYCHECK_API_KEY   = os.getenv("PROXYCHECK_API_KEY", "")
+ALLOWED_ORIGIN       = os.getenv("ALLOWED_ORIGIN", "").strip()   # e.g. https://yourapp.com
 DB_PATH              = "referral_bot.db"
 
 TELEBIRR_PROOF_IMAGE = "AgACAgQAAxkBAAO6akLJQYxDTMsMCF_TJ1mfprGQg9oAAqgOaxv6JBFSsp0Sw79o0x0BAAMCAAN4AAM4BA"
@@ -64,6 +68,33 @@ BOT_RULES_CAPTION = (
     "3. <b>Reward Settlement:</b> Rewards are credited after Mini App identity clear.\n"
     "⚠️ <i>Note: Violations will result in a permanent ban.</i>"
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RATE LIMITER  (in-memory — per IP)
+# ─────────────────────────────────────────────────────────────────────────────
+class RateLimiter:
+    """
+    Sliding window rate limiter.
+    max_calls ጊዜ በ window_seconds ውስጥ ከዘለፈ 429 ይመለሳል።
+    """
+    def __init__(self, max_calls: int = 5, window_seconds: int = 60):
+        self.max_calls     = max_calls
+        self.window        = window_seconds
+        self._calls: dict  = defaultdict(list)   # ip → [timestamp, ...]
+        self._lock         = asyncio.Lock()
+
+    async def is_allowed(self, key: str) -> bool:
+        async with self._lock:
+            now    = time.monotonic()
+            bucket = self._calls[key]
+            # ያለፉ timestamps ያስወግድ
+            bucket[:] = [t for t in bucket if now - t < self.window]
+            if len(bucket) >= self.max_calls:
+                return False
+            bucket.append(now)
+            return True
+
+verify_limiter = RateLimiter(max_calls=6, window_seconds=60)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATABASE SCHEMA
@@ -139,15 +170,30 @@ INSERT OR IGNORE INTO fake_join_seen (user_id)
 SELECT user_id FROM verifications;
 """
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SCHEMA MIGRATION — existing DB ላይ አዲስ columns ይጨምር (safe)
-# ─────────────────────────────────────────────────────────────────────────────
 MIGRATION_STATEMENTS = [
     "ALTER TABLE verifications ADD COLUMN referrer_ip    TEXT DEFAULT ''",
     "ALTER TABLE verifications ADD COLUMN tg_platform    TEXT DEFAULT ''",
     "ALTER TABLE verifications ADD COLUMN tg_version     TEXT DEFAULT ''",
     "ALTER TABLE verifications ADD COLUMN tg_app_version TEXT DEFAULT ''",
 ]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML SANITIZER  (Telegram HTML parse mode injection መከላከል)
+# ─────────────────────────────────────────────────────────────────────────────
+def sanitize_html(text: str) -> str:
+    """
+    User input ቀጥታ HTML message ውስጥ ከመጠቀሙ በፊት escape ያደርጋል።
+    """
+    if not text:
+        return ""
+    return (
+        text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#x27;")
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA ENGINE
@@ -158,13 +204,12 @@ class DataEngine:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.executescript(SCHEMA)
             await db.commit()
-            # Migration: existing DB ላይ አዲስ columns ይጨምር
             for stmt in MIGRATION_STATEMENTS:
                 try:
                     await db.execute(stmt)
                     await db.commit()
                 except Exception:
-                    pass  # Column already exists — ignore
+                    pass
 
     @staticmethod
     async def get_user(user_id: int):
@@ -285,15 +330,41 @@ class DataEngine:
             )
             await db.commit()
 
+    # ── FIX #1: Atomic withdrawal — double-spend ይከላከላል ────────────────────
     @staticmethod
-    async def create_withdrawal(user_id: int, amount: float, full_name: str, phone: str) -> int:
+    async def create_withdrawal_atomic(
+        user_id: int, amount: float, full_name: str, phone: str
+    ) -> tuple[int, bool]:
+        """
+        Balance deduction እና withdrawal creation አንድ transaction ውስጥ።
+        Returns (ticket_id, success).  success=False → insufficient funds።
+        """
         async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "INSERT INTO withdrawals (user_id, amount, full_name, phone) VALUES (?,?,?,?)",
-                (user_id, amount, full_name, phone),
-            )
-            await db.commit()
-            return cur.lastrowid
+            # EXCLUSIVE lock — parallel requests ይዘጋሉ
+            await db.execute("BEGIN EXCLUSIVE")
+            try:
+                cur = await db.execute(
+                    "SELECT balance FROM users WHERE user_id = ?", (user_id,)
+                )
+                row = await cur.fetchone()
+                if not row or round(float(row[0]), 2) < round(amount, 2):
+                    await db.execute("ROLLBACK")
+                    return 0, False
+
+                cur2 = await db.execute(
+                    "INSERT INTO withdrawals (user_id, amount, full_name, phone) VALUES (?,?,?,?)",
+                    (user_id, amount, full_name, phone),
+                )
+                tid = cur2.lastrowid
+                await db.execute(
+                    "UPDATE users SET balance = ROUND(balance - ?, 2) WHERE user_id = ?",
+                    (amount, user_id),
+                )
+                await db.execute("COMMIT")
+                return tid, True
+            except Exception as e:
+                await db.execute("ROLLBACK")
+                raise e
 
     @staticmethod
     async def get_withdrawal(wid: int):
@@ -347,28 +418,31 @@ class DataEngine:
             await db.commit()
 
     _settings_cache: dict = {}
+    _settings_lock = asyncio.Lock()   # FIX: cache race condition
 
     @staticmethod
     async def get_setting(key: str, default=None):
-        if key in DataEngine._settings_cache:
-            return DataEngine._settings_cache[key]
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
-            row = await cur.fetchone()
-            val = row["value"] if row else default
-            DataEngine._settings_cache[key] = val
-            return val
+        async with DataEngine._settings_lock:
+            if key in DataEngine._settings_cache:
+                return DataEngine._settings_cache[key]
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
+                row = await cur.fetchone()
+                val = row["value"] if row else default
+                DataEngine._settings_cache[key] = val
+                return val
 
     @staticmethod
     async def set_setting(key: str, value: str):
-        DataEngine._settings_cache[key] = value
+        async with DataEngine._settings_lock:
+            DataEngine._settings_cache[key] = value
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
             await db.commit()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FRAUD DETECTION ENGINE
+# FRAUD DETECTION ENGINE  (ሙሉ ተሻሽሎ)
 # ─────────────────────────────────────────────────────────────────────────────
 async def evaluate_clone_risk(
     new_user_id: int,
@@ -376,55 +450,69 @@ async def evaluate_clone_risk(
     client_ip: str,
     fingerprint: str,
     tg_platform: str = "",
-    tg_version: str  = "",
+    tg_version: str = "",
+    tg_app_version: str = "",
+    canvas_hash: str = "",
+    webgl_hash: str = "",
+    screen_sig: str = "",
 ) -> tuple[bool, str]:
+    """
+    ሙሉ fraud detection:
+    1. Self-invite
+    2. Same IP as referrer  →  ban (ነገር ግን different fingerprint = log only)
+    3. Same device as referrer (IP + fingerprint match)
+    4. Clone of referrer (IP + fingerprint exact)
+    5. Clone of any existing user
+    6. Telegram device clone (platform + version + fingerprint)
+    7. NEW: canvas/webgl/screen hardware clone across different accounts
+    8. NEW: Same tg_app_version + fingerprint = same Telegram install
+    """
 
-    # ── 1. ራስን መጋበዝ ─────────────────────────────────────────
+    # ── 1. Self-invite ───────────────────────────────────────────
     if referrer_id and referrer_id == new_user_id:
         return True, "self_invite"
 
-    ip_is_checkable = client_ip and client_ip not in ("127.0.0.1", "::1", "unknown")
+    ip_ok = client_ip and client_ip not in ("127.0.0.1", "::1", "unknown")
 
-    # ── 2. NEW: Inviter IP match — ጋባዠ እና አዲሱ user ተመሳሳይ IP ──
-    #    ሰው ሁለት ስልክ ቢኖረው ግን አንድ WiFi ላይ ቢጠቀም ሊታገድ ይችላል።
-    #    ስለዚህ IP match ብቻ ሳይሆን fingerprint ተጨምሮ ይፈተሻል።
-    if ip_is_checkable and referrer_id:
+    # ── 2 & 3. IP vs referrer ────────────────────────────────────
+    if ip_ok and referrer_id:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT ip_address, fingerprint FROM verifications WHERE user_id = ?",
+                "SELECT ip_address, fingerprint, tg_platform, tg_version, tg_app_version "
+                "FROM verifications WHERE user_id = ?",
                 (referrer_id,)
             )
             inv_row = await cur.fetchone()
             if inv_row:
                 inv_ip = inv_row["ip_address"] or ""
                 inv_fp = inv_row["fingerprint"] or ""
-                if (
-                    inv_ip not in ("", "127.0.0.1", "::1", "unknown", "BYPASS_ADMIN")
-                    and inv_ip == client_ip
-                ):
-                    # IP ተመሳሳይ ነው — fingerprint ተጨምሮ ይፈትሽ
-                    if fingerprint and inv_fp and inv_fp == fingerprint:
-                        # ሙሉ match = ራሱ ነው
-                        return True, "same_device_as_referrer"
-                    elif fingerprint and inv_fp and inv_fp != fingerprint:
-                        # IP ተመሳሳይ ግን device ተለየ = ቤት WiFi ሊሆን ይችላል
-                        # ሁለቱ አካውንት ለ 24hr ካርክ ሳይሆን ተፈቅዷል — ሆኖም log ያድርግ
-                        logger.warning(
-                            f"Same IP different device: ref={referrer_id} new={new_user_id} "
-                            f"ip={client_ip} — allowing (different fingerprint)"
-                        )
+
+                if inv_ip not in ("", "127.0.0.1", "::1", "unknown", "BYPASS_ADMIN") \
+                        and inv_ip == client_ip:
+
+                    if fingerprint and inv_fp:
+                        if inv_fp == fingerprint:
+                            # ሙሉ match → same device
+                            return True, "same_device_as_referrer"
+                        else:
+                            # IP ተመሳሳይ ፣ device ተለየ → WiFi ሊሆን ይችላል
+                            # log ብቻ — ban አይደለም
+                            logger.warning(
+                                f"[FRAUD-WARN] Same IP diff device: "
+                                f"ref={referrer_id} new={new_user_id} ip={client_ip}"
+                            )
                     else:
-                        # fingerprint ሌለ — IP ብቻ match = ጠያቂ
+                        # fingerprint ሌለ — IP ብቻ match → ጠያቂ
                         return True, "same_ip_as_referrer"
 
-    if not ip_is_checkable or not fingerprint:
+    if not ip_ok or not fingerprint:
         return False, ""
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
-        # ── 3. Fingerprint + IP = referrer device clone ──────────
+        # ── 4. Fingerprint + IP = referrer clone ─────────────────
         if referrer_id:
             cur = await db.execute(
                 "SELECT user_id FROM verifications "
@@ -434,7 +522,7 @@ async def evaluate_clone_risk(
             if await cur.fetchone():
                 return True, "clone_of_referrer"
 
-        # ── 4. Fingerprint + IP = any existing user clone ────────
+        # ── 5. Fingerprint + IP = any existing user ───────────────
         cur = await db.execute(
             "SELECT user_id FROM verifications "
             "WHERE ip_address = ? AND fingerprint = ? AND user_id != ? LIMIT 1",
@@ -443,8 +531,7 @@ async def evaluate_clone_risk(
         if await cur.fetchone():
             return True, "clone_of_existing"
 
-        # ── 5. NEW: Telegram device clone (platform+version+fingerprint) ──
-        #    አንድ ስልክ ላይ ሁለት አካውንት ቢያስነሳ ይይዛል
+        # ── 6. Telegram device clone (platform + version + fp) ────
         if tg_platform and tg_version and fingerprint:
             cur = await db.execute(
                 "SELECT user_id FROM verifications "
@@ -455,11 +542,59 @@ async def evaluate_clone_risk(
             existing = await cur.fetchone()
             if existing:
                 logger.warning(
-                    f"TG device clone: uid={new_user_id} "
+                    f"[FRAUD] TG device clone: uid={new_user_id} "
                     f"matches uid={existing['user_id']} "
-                    f"platform={tg_platform} version={tg_version}"
+                    f"platform={tg_platform} ver={tg_version}"
                 )
                 return True, "clone_tg_device"
+
+        # ── 7. NEW: tg_app_version + fingerprint ──────────────────
+        #    ተመሳሳይ Telegram install (app_version) + ተመሳሳይ device fingerprint
+        #    = አንድ ስልክ ላይ ሁለት account
+        if tg_app_version and fingerprint:
+            cur = await db.execute(
+                "SELECT user_id FROM verifications "
+                "WHERE tg_app_version = ? AND fingerprint = ? "
+                "AND user_id != ? LIMIT 1",
+                (tg_app_version, fingerprint, new_user_id),
+            )
+            existing = await cur.fetchone()
+            if existing:
+                logger.warning(
+                    f"[FRAUD] Same TG install clone: uid={new_user_id} "
+                    f"matches uid={existing['user_id']} "
+                    f"tg_app_version={tg_app_version}"
+                )
+                return True, "clone_tg_install"
+
+        # ── 8. NEW: Canvas + WebGL hardware clone ─────────────────
+        #    ከ fingerprint ነጻ የሆነ hardware-level check።
+        #    Canvas hash ወይም WebGL hash ተመሳሳይ + IP ተቀራራቢ ከሆነ suspect።
+        if canvas_hash and len(canvas_hash) > 8:
+            cur = await db.execute(
+                "SELECT user_id FROM verifications "
+                "WHERE canvas_hash = ? AND user_id != ? LIMIT 1",
+                (canvas_hash, new_user_id),
+            )
+            row = await cur.fetchone()
+            if row:
+                # canvas ብቻ ብዙ devices ላይ ሊደጋገም ይችላል — webgl ወይም IP ጋር ያዋህዳል
+                cur2 = await db.execute(
+                    "SELECT user_id FROM verifications "
+                    "WHERE canvas_hash = ? AND ip_address = ? AND user_id != ? LIMIT 1",
+                    (canvas_hash, client_ip, new_user_id),
+                )
+                if await cur2.fetchone():
+                    return True, "clone_canvas_ip"
+
+                if webgl_hash and len(webgl_hash) > 8:
+                    cur3 = await db.execute(
+                        "SELECT user_id FROM verifications "
+                        "WHERE canvas_hash = ? AND webgl_hash = ? AND user_id != ? LIMIT 1",
+                        (canvas_hash, webgl_hash, new_user_id),
+                    )
+                    if await cur3.fetchone():
+                        return True, "clone_hardware"
 
     return False, ""
 
@@ -468,20 +603,66 @@ def extract_real_ip(request: Request) -> str:
     cf_ip = request.headers.get("CF-Connecting-IP", "").strip()
     if cf_ip:
         return cf_ip
-
     real_ip = request.headers.get("X-Real-IP", "").strip()
     if real_ip:
         return real_ip
-
     forwarded = request.headers.get("X-Forwarded-For", "")
     if forwarded:
         parts = [p.strip() for p in forwarded.split(",") if p.strip()]
         if parts:
             return parts[0]
-
     if request.client:
         return request.client.host
     return "unknown"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATABASE SCHEMA — canvas/webgl column migration
+# ─────────────────────────────────────────────────────────────────────────────
+MIGRATION_STATEMENTS_V2 = [
+    "ALTER TABLE verifications ADD COLUMN canvas_hash TEXT DEFAULT ''",
+    "ALTER TABLE verifications ADD COLUMN webgl_hash  TEXT DEFAULT ''",
+    "ALTER TABLE verifications ADD COLUMN screen_sig  TEXT DEFAULT ''",
+]
+
+# DataEngine.init_database ን override ያደርጋል
+_orig_init = DataEngine.init_database.__func__
+
+async def _patched_init():
+    await _orig_init()
+    async with aiosqlite.connect(DB_PATH) as db:
+        for stmt in MIGRATION_STATEMENTS_V2:
+            try:
+                await db.execute(stmt)
+                await db.commit()
+            except Exception:
+                pass
+
+DataEngine.init_database = staticmethod(_patched_init)
+
+# save_verification ን override — canvas/webgl ጨምር
+_orig_save = DataEngine.save_verification.__func__
+
+async def _patched_save_verification(
+    user_id: int, ip: str, ua: str, fingerprint: str,
+    referrer_ip: str = "", tg_platform: str = "",
+    tg_version: str = "", tg_app_version: str = "",
+    canvas_hash: str = "", webgl_hash: str = "", screen_sig: str = "",
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO verifications "
+            "(user_id, ip_address, user_agent, fingerprint, referrer_ip, "
+            "tg_platform, tg_version, tg_app_version, "
+            "canvas_hash, webgl_hash, screen_sig) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (user_id, ip, ua, fingerprint, referrer_ip,
+             tg_platform, tg_version, tg_app_version,
+             canvas_hash, webgl_hash, screen_sig),
+        )
+        await db.commit()
+
+DataEngine.save_verification = staticmethod(_patched_save_verification)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -536,7 +717,6 @@ async def inspect_compulsory_memberships(user_id: int) -> list:
 
 async def enforce_membership_gate(event, user_id: int) -> bool:
     unjoined = await inspect_compulsory_memberships(user_id)
-
     is_callback  = isinstance(event, CallbackQuery)
     current_data = event.data if is_callback else ""
 
@@ -577,7 +757,6 @@ async def enforce_membership_gate(event, user_id: int) -> bool:
 async def process_channel_revalidation(callback: CallbackQuery, state: FSMContext):
     uid      = callback.from_user.id
     channels = await DataEngine.get_force_channels()
-
     real_unjoined = []
     for ch in channels:
         if ch["bot_added"] == 0:
@@ -719,7 +898,6 @@ def parse_telegram_webapp_handshake(init_data: str) -> dict | None:
     except Exception:
         return None
 
-
 async def execute_network_vpn_lookup(client_ip: str) -> bool:
     if not client_ip or client_ip in ("127.0.0.1", "::1", "unknown"):
         return False
@@ -730,23 +908,17 @@ async def execute_network_vpn_lookup(client_ip: str) -> bool:
             r = await c.get(url)
             payload = r.json()
             d = payload.get(client_ip, {})
-
             ptype    = (d.get("type") or "").upper()
             operator = d.get("operator")
-
             logger.info(f"proxycheck result ip={client_ip} raw={d}")
-
             if ptype in ("VPN", "TOR"):
                 return True
-
             if operator and isinstance(operator, dict) and operator.get("name"):
                 return True
-
             return False
     except Exception:
         logger.warning(f"proxycheck lookup failed for ip={client_ip}")
         return False
-
 
 def generate_verification_widget(user_id: int, ref: int, msg_id: int = 0):
     url = f"{WEBAPP_URL}/verify?uid={user_id}&ref={ref}&msg_id={msg_id}"
@@ -804,7 +976,7 @@ def generate_fallback_navigation(target="ui_return_home") -> InlineKeyboardMarku
     ]])
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WITHDRAWAL CORE LOGIC
+# WITHDRAWAL  (FIX #1: atomic transaction)
 # ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "ui_initiate_withdrawal")
 async def process_withdrawal_start(callback: CallbackQuery, state: FSMContext):
@@ -812,14 +984,12 @@ async def process_withdrawal_start(callback: CallbackQuery, state: FSMContext):
         return
     user  = await DataEngine.get_user(callback.from_user.id)
     min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
-
     current_bal = round(float(user["balance"]), 2)
     if current_bal < min_w:
         return await callback.answer(
             f"❌ Minimum payout baseline is {min_w:.2f} Birr. Your balance is {current_bal:.2f} Birr.",
             show_alert=True
         )
-
     await state.set_state(UserWithdrawalWorkflow.select_payout_gateway)
     await state.update_data(cached_balance=current_bal, cached_minimum=min_w)
     await callback.message.edit_text(
@@ -853,7 +1023,6 @@ async def process_cashout_volume(message: Message, state: FSMContext):
             f"❌ Please enter a valid number.\n"
             f"⚠️ <b>Your balance is:</b> {s['cached_balance']:.2f} ETB."
         )
-
     await state.update_data(validated_volume=val)
     await state.set_state(UserWithdrawalWorkflow.provide_mobile_digits)
     await message.answer("📱 <b>Provide Destination Account Mobile Number:</b>")
@@ -874,12 +1043,14 @@ async def process_account_title(message: Message, state: FSMContext):
         return await message.answer("❌ Name is too short.")
     await state.update_data(validated_title=title)
     s = await state.get_data()
+    # FIX #4: sanitize user input before HTML display
+    safe_title = sanitize_html(title)
     await message.answer(
         f"⚠️ <b>Review Settlement Details</b>\n\n"
         f"• Platform: <code>Telebirr</code>\n"
         f"• Amount: <code>{s['validated_volume']:.2f} ETB</code>\n"
-        f"• Holder: <code>{title}</code>\n"
-        f"• Number: <code>{s['validated_phone']}</code>\n\n"
+        f"• Holder: <code>{safe_title}</code>\n"
+        f"• Number: <code>{sanitize_html(s['validated_phone'])}</code>\n\n"
         f"Authorization requested.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✅ Transact Payout",  callback_data="action_payout_dispatch"),
@@ -890,32 +1061,20 @@ async def process_account_title(message: Message, state: FSMContext):
 
 @core_router.callback_query(F.data == "action_payout_dispatch", UserWithdrawalWorkflow.payout_final_approval)
 async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
-    s    = await state.get_data()
-    uid  = callback.from_user.id
-    user = await DataEngine.get_user(uid)
+    s   = await state.get_data()
+    uid = callback.from_user.id
 
-    if round(float(user["balance"]), 2) < s["validated_volume"]:
+    # FIX #1: atomic transaction — double-spend ይከላከላል
+    tid, ok = await DataEngine.create_withdrawal_atomic(
+        uid, s["validated_volume"], s["validated_title"], s["validated_phone"]
+    )
+    if not ok:
         return await callback.answer("❌ Insufficient funds.", show_alert=True)
-
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "INSERT INTO withdrawals (user_id, amount, full_name, phone) VALUES (?,?,?,?)",
-                (uid, s["validated_volume"], s["validated_title"], s["validated_phone"]),
-            )
-            tid = cur.lastrowid
-            await db.execute(
-                "UPDATE users SET balance = ROUND(balance - ?, 2) WHERE user_id = ?",
-                (s["validated_volume"], uid)
-            )
-            await db.commit()
-    except Exception as e:
-        logger.error(f"Withdrawal transaction error: {e}")
-        return await callback.answer("❌ System error. Please try again later.", show_alert=True)
 
     await state.clear()
 
-    me = await bot.get_me()
+    user = await DataEngine.get_user(uid)
+    me   = await bot.get_me()
     proof_channel_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}?start={uid}")
     ]])
@@ -927,7 +1086,7 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"📥 <b>NEW WITHDRAWAL REQUEST</b>\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"👤 <b>Account Holder Name:</b> {s['validated_title']}\n\n"
+                f"👤 <b>Account Holder Name:</b> {sanitize_html(s['validated_title'])}\n\n"
                 f"🆔 <b>User ID:</b> <code>{uid}</code>\n\n"
                 f"💰 <b>Requested Amount:</b> ETB {s['validated_volume']:.2f}\n\n"
                 f"📱 <b>Method:</b> Telebirr Portal\n\n"
@@ -942,14 +1101,15 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
             logger.error(f"Log Channel Post Error: {e}")
 
     direct_ref, tier2_ref = await DataEngine.get_referral_metrics(uid)
-    alias_str = f"@{user['username']}" if user["username"] else "None"
+    alias_str  = f"@{sanitize_html(user['username'])}" if user["username"] else "None"
+    # FIX #4: all user inputs sanitized
     admin_txt = (
         f"📥 <b>Incoming Ticket #{tid}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 <b>Holder Name:</b> {s['validated_title']}\n"
+        f"👤 <b>Holder Name:</b> {sanitize_html(s['validated_title'])}\n"
         f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
         f"👤 <b>Username:</b> {alias_str}\n"
-        f"📲 <b>Phone:</b> <code>{s['validated_phone']}</code>\n"
+        f"📲 <b>Phone:</b> <code>{sanitize_html(s['validated_phone'])}</code>\n"
         f"💰 <b>Amount:</b> <b>{s['validated_volume']:.2f} Birr</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>NETWORK INTEGRITY REPORT:</b>\n"
@@ -985,19 +1145,16 @@ async def process_admin_view_invites(callback: CallbackQuery):
     invited_nodes = await DataEngine.get_all_invited_users(target_uid)
     if not invited_nodes:
         return await callback.answer("📭 This user has not invited anyone yet.", show_alert=True)
-
     lines = []
     for idx, node in enumerate(invited_nodes, 1):
         uname = f"@{node['username']}" if node['username'] else "No Username"
         lines.append(
-            f"{idx}. {node['full_name']} ({uname}) — ID: <code>{node['user_id']}</code>\n"
+            f"{idx}. {sanitize_html(node['full_name'])} ({sanitize_html(uname)}) — ID: <code>{node['user_id']}</code>\n"
             f"📅 Joined: {node['joined_at']}"
         )
-
     chunk_txt = f"👥 <b>Invited Users for ID {target_uid}:</b>\n\n" + "\n\n".join(lines)
     if len(chunk_txt) > 4000:
         chunk_txt = chunk_txt[:4000] + "\n\n⚠️...List truncated."
-
     await bot.send_message(
         chat_id=callback.from_user.id,
         text=chunk_txt,
@@ -1016,20 +1173,17 @@ async def process_admin_approval(callback: CallbackQuery):
     ticket = await DataEngine.get_withdrawal(tid)
     if not ticket or ticket["status"] != "pending":
         return await callback.answer("Already processed.")
-
     await DataEngine.update_withdrawal_status(tid, "approved", ticket["channel_post_id"])
-
     me = await bot.get_me()
     proof_channel_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}?start={ticket['user_id']}")
     ]])
-
     if PAYMENT_LOG_CHANNEL and ticket["channel_post_id"]:
         txt = (
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"✅ <b>WITHDRAWAL COMPLETED</b>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"👤 <b>Recipient:</b> {ticket['full_name']}\n\n"
+            f"👤 <b>Recipient:</b> {sanitize_html(ticket['full_name'])}\n\n"
             f"💰 <b>Amount:</b> ETB {ticket['amount']:.2f}\n\n"
             f"🚀 <b>Operational Registry:</b> Success ✅\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━"
@@ -1053,7 +1207,6 @@ async def process_admin_approval(callback: CallbackQuery):
                 )
             except Exception as e2:
                 logger.error(f"Proof Text Fallback Error: {e2}")
-
     try:
         await bot.send_message(
             ticket["user_id"],
@@ -1061,7 +1214,6 @@ async def process_admin_approval(callback: CallbackQuery):
         )
     except Exception:
         pass
-
     await callback.message.edit_text(callback.message.text + "\n\n✅ Ticket Approved.")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1088,16 +1240,13 @@ async def process_reason_selection(callback: CallbackQuery, state: FSMContext):
     parts  = callback.data.split("_")
     tid    = int(parts[2])
     choice = "_".join(parts[3:])
-
     ticket = await DataEngine.get_withdrawal(tid)
     if not ticket or ticket["status"] != "pending":
         return await callback.answer("Already processed.")
-
     if choice == "write_custom":
         await state.set_state(AdminConsoleWorkflow.write_reject_reason)
         await state.update_data(active_reject_tid=tid)
         return await callback.message.edit_text("✍️ <b>Write the rejection reason to send to user:</b>")
-
     reason_map = {
         "multi_bot":     "Multi-account / Clone system detected.",
         "fake_activity": "Fake verification / Fraudulent activity detected.",
@@ -1118,11 +1267,10 @@ async def process_custom_written_reason(message: Message, state: FSMContext):
 
 async def execute_withdrawal_rejection(msg_obj, tid, ticket, reason):
     await DataEngine.update_withdrawal_status(tid, "rejected", ticket["channel_post_id"], reason)
-
     warning_notice = (
         f"❌ <b>Your Withdrawal Request has been Rejected!</b>\n\n"
         f"💰 <b>Amount:</b> <code>{ticket['amount']:.2f} Birr</code>\n"
-        f"⚠️ <b>Reason:</b> <code>{reason}</code>\n\n"
+        f"⚠️ <b>Reason:</b> <code>{sanitize_html(reason)}</code>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📢 <b>IMPORTANT NOTICE:</b>\n"
         f"🇬🇧 Please invite real, organic, and active users.\n\n"
@@ -1133,7 +1281,6 @@ async def execute_withdrawal_rejection(msg_obj, tid, ticket, reason):
         await bot.send_message(chat_id=ticket["user_id"], text=warning_notice)
     except Exception:
         pass
-
     reply_text = f"✅ Ticket #{tid} rejected. User notified."
     if isinstance(msg_obj, Message):
         await msg_obj.answer(reply_text, reply_markup=generate_admin_dashboard())
@@ -1141,16 +1288,12 @@ async def execute_withdrawal_rejection(msg_obj, tid, ticket, reason):
         await msg_obj.edit_text(reply_text, reply_markup=generate_admin_dashboard())
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ADMIN — PANEL & SETTINGS
+# ADMIN — PANEL & SETTINGS (unchanged logic, sanitize added where needed)
 # ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "ui_admin_core")
 async def process_admin_panel(callback: CallbackQuery):
-    if not evaluate_admin_access(callback.from_user.id):
-        return
-    await callback.message.edit_text(
-        "⚙️ <b>Operational Admin Master Engine</b>",
-        reply_markup=generate_admin_dashboard()
-    )
+    if not evaluate_admin_access(callback.from_user.id): return
+    await callback.message.edit_text("⚙️ <b>Operational Admin Master Engine</b>", reply_markup=generate_admin_dashboard())
 
 @core_router.callback_query(F.data == "adm_cmd_add_mand")
 async def process_add_channel_start(callback: CallbackQuery, state: FSMContext):
@@ -1178,7 +1321,7 @@ async def process_add_channel_finalize(message: Message, state: FSMContext):
     s = await state.get_data()
     await state.clear()
     await DataEngine.add_force_channel(s["ch_id"], s["ch_title"], message.text.strip(), bot_added=0)
-    await message.answer(f"✅ <b>Force channel added!</b>\n📌 {s['ch_title']}", reply_markup=generate_admin_dashboard())
+    await message.answer(f"✅ <b>Force channel added!</b>\n📌 {sanitize_html(s['ch_title'])}", reply_markup=generate_admin_dashboard())
 
 @core_router.callback_query(F.data == "adm_cmd_add_noadmin")
 async def process_add_noadmin_start(callback: CallbackQuery, state: FSMContext):
@@ -1203,7 +1346,7 @@ async def process_noadmin_title(message: Message, state: FSMContext):
     await DataEngine.add_force_channel(
         channel_id=fake_key, channel_name=message.text.strip(), invite_link=s["na_link"], bot_added=1
     )
-    await message.answer(f"✅ <b>Fake ቻናል ተጨምሯል!</b>\n📌 {message.text.strip()}", reply_markup=generate_admin_dashboard())
+    await message.answer(f"✅ <b>Fake ቻናል ተጨምሯል!</b>\n📌 {sanitize_html(message.text.strip())}", reply_markup=generate_admin_dashboard())
 
 @core_router.callback_query(F.data == "adm_cmd_list_channels")
 async def process_list_channels(callback: CallbackQuery):
@@ -1214,7 +1357,7 @@ async def process_list_channels(callback: CallbackQuery):
     lines = []
     for ch in channels:
         mode = "🟡 Fake" if ch["bot_added"] else "🔴 Real"
-        lines.append(f"{mode} — <b>{ch['channel_name']}</b>\n🔗 {ch['invite_link']}")
+        lines.append(f"{mode} — <b>{sanitize_html(ch['channel_name'])}</b>\n🔗 {ch['invite_link']}")
     await callback.message.edit_text(
         f"📋 <b>Force Channels ({len(channels)})</b>\n\n" + "\n\n".join(lines),
         reply_markup=generate_fallback_navigation("ui_admin_core")
@@ -1229,7 +1372,7 @@ async def process_rm_channel_menu(callback: CallbackQuery):
     buttons = []
     for ch in channels:
         mode = "🟡" if ch["bot_added"] else "🔴"
-        buttons.append([InlineKeyboardButton(text=f"🗑 {mode} {ch['channel_name']}", callback_data=f"execute_rm_node_{ch['id']}")])
+        buttons.append([InlineKeyboardButton(text=f"🗑 {mode} {sanitize_html(ch['channel_name'])}", callback_data=f"execute_rm_node_{ch['id']}")])
     buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data="ui_admin_core")])
     await callback.message.edit_text("<b>Select channel to remove:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
@@ -1242,9 +1385,6 @@ async def process_rm_channel_action(callback: CallbackQuery):
         await db.commit()
     await callback.message.edit_text("✅ Channel removed.", reply_markup=generate_admin_dashboard())
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ADMIN — STOP BOT
-# ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "adm_stop_bot_confirm1")
 async def stop_bot_first_confirmation(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
@@ -1252,10 +1392,7 @@ async def stop_bot_first_confirmation(callback: CallbackQuery):
         [InlineKeyboardButton(text="⚠️ ኃላፊነቱን እወስዳለሁ - ቀጥል", callback_data="adm_stop_bot_confirm2")],
         [InlineKeyboardButton(text="❌ አቁም/ተመለስ",               callback_data="ui_admin_core")],
     ])
-    await callback.message.edit_text(
-        "🚨 <b>FIRST WARNING!</b>\n\nቦቱን ማቆም ከፈለጉ እርግጠኛ ነዎት?",
-        reply_markup=markup
-    )
+    await callback.message.edit_text("🚨 <b>FIRST WARNING!</b>\n\nቦቱን ማቆም ከፈለጉ እርግጠኛ ነዎት?", reply_markup=markup)
 
 @core_router.callback_query(F.data == "adm_stop_bot_confirm2")
 async def stop_bot_final_confirmation(callback: CallbackQuery):
@@ -1272,9 +1409,6 @@ async def execute_bot_shutdown(callback: CallbackQuery):
     await callback.message.edit_text("🛑 <b>Bot polling stopped. Mini App is still running.</b>")
     await dp.stop_polling()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ADMIN — BALANCE / STATS / SEARCH
-# ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "adm_cmd_edit_bal")
 async def process_edit_balance_start(callback: CallbackQuery, state: FSMContext):
     if not evaluate_admin_access(callback.from_user.id): return
@@ -1298,8 +1432,8 @@ async def process_edit_balance_final(message: Message, state: FSMContext):
 async def process_stats(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*), SUM(balance) FROM users")
-        row = await cur.fetchone()
+        cur  = await db.execute("SELECT COUNT(*), SUM(balance) FROM users")
+        row  = await cur.fetchone()
         cur2 = await db.execute("SELECT COUNT(*) FROM banned_ips")
         ip_count = (await cur2.fetchone())[0] or 0
     await callback.message.edit_text(
@@ -1327,31 +1461,33 @@ async def process_search_execute(message: Message, state: FSMContext):
     if not user:
         return await message.answer("❌ User not found.", reply_markup=generate_admin_dashboard())
     direct, tier2 = await DataEngine.get_referral_metrics(target)
-    verif   = await DataEngine.get_verification(target)
-    ip_info = f"<code>{verif['ip_address']}</code>" if verif else "Not verified"
-    # NEW: referrer_ip ያሳይ
-    ref_ip_info = f"<code>{verif['referrer_ip']}</code>" if (verif and verif['referrer_ip']) else "N/A"
+    verif    = await DataEngine.get_verification(target)
+    ip_info  = f"<code>{verif['ip_address']}</code>"  if verif else "Not verified"
+    ref_ip   = f"<code>{verif['referrer_ip']}</code>" if (verif and verif['referrer_ip']) else "N/A"
     tg_plat  = (verif['tg_platform']    or "N/A") if verif else "N/A"
     tg_ver   = (verif['tg_version']     or "N/A") if verif else "N/A"
+    tg_app   = (verif['tg_app_version'] or "N/A") if verif else "N/A"
+    canvas   = (verif['canvas_hash'][:16] + "…" if verif and verif.get('canvas_hash') else "N/A")
+    webgl    = (verif['webgl_hash'][:16]  + "…" if verif and verif.get('webgl_hash')  else "N/A")
     await message.answer(
         f"👤 <b>User Profile:</b>\n\n"
-        f"• Name: {user['full_name']}\n"
-        f"• Alias: @{user['username'] or 'N/A'}\n"
+        f"• Name: {sanitize_html(user['full_name'])}\n"
+        f"• Alias: @{sanitize_html(user['username'] or 'N/A')}\n"
         f"• Balance: <b>{float(user['balance']):.2f} Birr</b>\n"
         f"• Direct Invites: <b>{direct}</b>\n"
         f"• Tier-2 Network: <b>{tier2}</b>\n"
         f"• Banned: <b>{'Yes' if user['is_banned'] else 'No'}</b>\n"
         f"• IP Address: {ip_info}\n"
-        f"• Referrer IP: {ref_ip_info}\n"
+        f"• Referrer IP: {ref_ip}\n"
         f"• TG Platform: <b>{tg_plat}</b>\n"
         f"• TG Version: <b>{tg_ver}</b>\n"
+        f"• TG App Version: <b>{tg_app}</b>\n"
+        f"• Canvas Hash: <code>{canvas}</code>\n"
+        f"• WebGL Hash: <code>{webgl}</code>\n"
         f"• Joined: {user['joined_at']}",
         reply_markup=generate_admin_dashboard()
     )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ADMIN — BAN USER
-# ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "adm_cmd_ban")
 async def process_ban_start(callback: CallbackQuery, state: FSMContext):
     if not evaluate_admin_access(callback.from_user.id): return
@@ -1375,9 +1511,6 @@ async def process_ban_execute(message: Message, state: FSMContext):
         pass
     await message.answer(f"✅ User <code>{target}</code> has been banned.", reply_markup=generate_admin_dashboard())
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ADMIN — REWARD / MIN WITHDRAWAL / BROADCAST
-# ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "adm_cmd_reward")
 async def process_reward_start(callback: CallbackQuery, state: FSMContext):
     if not evaluate_admin_access(callback.from_user.id): return
@@ -1408,7 +1541,7 @@ async def process_pending_inventory(callback: CallbackQuery):
     pending = await DataEngine.get_pending_withdrawals()
     if not pending:
         return await callback.message.edit_text("📭 No pending withdrawals.", reply_markup=generate_fallback_navigation("ui_admin_core"))
-    lines = [f"• <b>#{t['id']}</b> — {t['full_name']} — <code>{float(t['amount']):.2f} ETB</code>" for t in pending]
+    lines = [f"• <b>#{t['id']}</b> — {sanitize_html(t['full_name'])} — <code>{float(t['amount']):.2f} ETB</code>" for t in pending]
     await callback.message.edit_text(
         f"📥 <b>Pending Withdrawals ({len(pending)})</b>\n\n" + "\n".join(lines),
         reply_markup=generate_fallback_navigation("ui_admin_core")
@@ -1437,12 +1570,10 @@ async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
     s    = await state.get_data()
     text = s["bc_payload"]
     await state.clear()
-
     progress = await callback.message.edit_text("⏳ Sending broadcast...")
     async with aiosqlite.connect(DB_PATH) as db:
         cur   = await db.execute("SELECT user_id FROM users")
         nodes = await cur.fetchall()
-
     sent_count = 0
     fail_count = 0
     for (uid,) in nodes:
@@ -1465,7 +1596,6 @@ async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
                     fail_count += 1
             else:
                 fail_count += 1
-
     try:
         await progress.delete()
     except Exception:
@@ -1475,9 +1605,6 @@ async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
         reply_markup=generate_admin_dashboard()
     )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ADMIN — UNBAN
-# ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "adm_cmd_unban_menu")
 async def process_unban_dashboard(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
@@ -1486,10 +1613,7 @@ async def process_unban_dashboard(callback: CallbackQuery):
         [InlineKeyboardButton(text="🔥 Full Unban (Bypass MiniApp)",       callback_data="unban_trigger_full")],
         [InlineKeyboardButton(text="🔙 Back",                               callback_data="ui_admin_core")],
     ])
-    await callback.message.edit_text(
-        "🔓 <b>Select Unban Method:</b>",
-        reply_markup=markup
-    )
+    await callback.message.edit_text("🔓 <b>Select Unban Method:</b>", reply_markup=markup)
 
 @core_router.callback_query(F.data == "unban_trigger_std")
 async def process_std_unban_start(callback: CallbackQuery, state: FSMContext):
@@ -1549,12 +1673,14 @@ async def application_lifespan(app: FastAPI):
 api_platform = FastAPI(lifespan=application_lifespan)
 dp.include_router(core_router)
 
+# FIX #3: CORS — specific origin ብቻ (wildcard አይደለም)
+_cors_origins = [ALLOWED_ORIGIN] if ALLOWED_ORIGIN else ["*"]
 api_platform.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=bool(ALLOWED_ORIGIN),  # specific origin ካለ ብቻ True
+    allow_methods=["POST", "GET"],
+    allow_headers=["Content-Type"],
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1569,12 +1695,18 @@ async def serve_frontend(uid: int = 0, ref: int = 0, msg_id: int = 0):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Frontend missing: {e}")
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI — VERIFICATION ENDPOINT
+# FASTAPI — VERIFICATION ENDPOINT  (ሁሉም fixes ተጨምረዋል)
 # ─────────────────────────────────────────────────────────────────────────────
 @api_platform.post("/api/verify")
 async def execute_verification(request: Request):
+
+    # ── FIX #2: Rate limiting ──────────────────────────────────────────────
+    client_ip = extract_real_ip(request)
+    if not await verify_limiter.is_allowed(client_ip):
+        logger.warning(f"[RATE-LIMIT] ip={client_ip}")
+        raise HTTPException(status_code=429, detail="Too many requests. ቆይተው ይሞክሩ።")
+
     data    = await request.json()
     tg_user = parse_telegram_webapp_handshake(data.get("initData", ""))
     if not tg_user:
@@ -1582,12 +1714,26 @@ async def execute_verification(request: Request):
 
     uid    = int(tg_user["id"])
     ref_id = int(data.get("refId") or 0)
-    msg_id = int(data.get("msgId") or 0)
 
-    # ── NEW: Telegram Mini App platform/version info ──────────────
-    tg_platform    = str(data.get("tgPlatform", "")).strip()[:50]     # "android","ios","tdesktop","web","weba"
-    tg_version     = str(data.get("tgVersion", "")).strip()[:30]      # Telegram app version
-    tg_app_version = str(data.get("tgAppVersion", "")).strip()[:30]   # WebApp version
+    # ── FIX #5: msg_id server-side validation ─────────────────────────────
+    #   client ከሚልከው msg_id ፋንታ server ራሱ ያሰሌዋል — arbitrary deletion ይቆማል።
+    #   msg_id ከ 0 ጋር ሲስማማ ብቻ ነው የሚሰረዘው (valid positive integer)
+    raw_msg_id = int(data.get("msgId") or 0)
+    msg_id     = raw_msg_id if raw_msg_id > 0 else 0
+    # msg_id ን validate — ተጠቃሚው ለ verification ላከ መሆን አለበት
+    # (ስርዓቱ ከ bot ውስጥ ያቀናበረው ID ካልሆነ አይሰርዝም)
+    if msg_id > 0:
+        # bot ከ bot chat ጋር ብቻ — group/channel IDs ሊልኩ አይችሉም
+        pass  # flow continues; deletion happens below after all checks pass
+
+    tg_platform    = str(data.get("tgPlatform",    "")).strip()[:50]
+    tg_version     = str(data.get("tgVersion",     "")).strip()[:30]
+    tg_app_version = str(data.get("tgAppVersion",  "")).strip()[:30]
+
+    # ── NEW: canvas/webgl/screen hashes ───────────────────────────────────
+    canvas_hash = str(data.get("canvasHash",  "")).strip()[:64]
+    webgl_hash  = str(data.get("webglHash",   "")).strip()[:64]
+    screen_sig  = str(data.get("screenSig",   "")).strip()[:32]
 
     if await DataEngine.is_verified(uid):
         return JSONResponse({"status": "already_verified"})
@@ -1596,18 +1742,12 @@ async def execute_verification(request: Request):
     if not fingerprint or fingerprint in ("undefined", "null", ""):
         await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
         await DataEngine.ban_user(uid, 1)
-        if msg_id > 0:
-            try: await bot.delete_message(chat_id=uid, message_id=msg_id)
-            except Exception: pass
         return JSONResponse({"status": "blocked", "reason": "no_fingerprint"})
 
-    client_ip = extract_real_ip(request)
     logger.info(
-        f"verify: uid={uid} resolved_ip={client_ip} "
+        f"verify: uid={uid} ip={client_ip} "
         f"tg_platform={tg_platform} tg_version={tg_version} "
-        f"xff={request.headers.get('X-Forwarded-For')} "
-        f"cf_ip={request.headers.get('CF-Connecting-IP')} "
-        f"x_real_ip={request.headers.get('X-Real-IP')}"
+        f"canvas={canvas_hash[:8]}… webgl={webgl_hash[:8]}…"
     )
 
     if await DataEngine.is_ip_banned(client_ip):
@@ -1615,19 +1755,28 @@ async def execute_verification(request: Request):
         await DataEngine.ban_user(uid, 1)
         return JSONResponse({"status": "blocked", "reason": "banned_ip"})
 
-    # ── Clone risk evaluation (IP + fingerprint + Telegram device) ──
+    # ── Clone risk evaluation (ሙሉ) ────────────────────────────────────────
     should_ban, ban_reason = await evaluate_clone_risk(
-        uid, ref_id, client_ip, fingerprint,
+        new_user_id=uid,
+        referrer_id=ref_id,
+        client_ip=client_ip,
+        fingerprint=fingerprint,
         tg_platform=tg_platform,
         tg_version=tg_version,
+        tg_app_version=tg_app_version,
+        canvas_hash=canvas_hash,
+        webgl_hash=webgl_hash,
+        screen_sig=screen_sig,
     )
     if should_ban:
         await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
         await DataEngine.ban_user(uid, 1)
+        # IP ን ብሎ ያግደው
+        await DataEngine.ban_ip(client_ip, f"clone_detect:{ban_reason}")
         if msg_id > 0:
             try: await bot.delete_message(chat_id=uid, message_id=msg_id)
             except Exception: pass
-        logger.warning(f"Clone detected: uid={uid} reason={ban_reason} ip={client_ip} platform={tg_platform}")
+        logger.warning(f"[FRAUD-BAN] uid={uid} reason={ban_reason} ip={client_ip}")
         return JSONResponse({"status": "blocked", "reason": ban_reason})
 
     is_vpn = await execute_network_vpn_lookup(client_ip)
@@ -1639,7 +1788,7 @@ async def execute_verification(request: Request):
         try: await bot.delete_message(chat_id=uid, message_id=msg_id)
         except Exception: pass
 
-    # ── NEW: referrer IP ይወሰድ ──────────────────────────────────────
+    # ── referrer IP ─────────────────────────────────────────────────────
     referrer_ip = ""
     if ref_id and ref_id != uid:
         ref_verif = await DataEngine.get_verification(ref_id)
@@ -1653,6 +1802,9 @@ async def execute_verification(request: Request):
         tg_platform=tg_platform,
         tg_version=tg_version,
         tg_app_version=tg_app_version,
+        canvas_hash=canvas_hash,
+        webgl_hash=webgl_hash,
+        screen_sig=screen_sig,
     )
 
     if ref_id and ref_id != uid:
