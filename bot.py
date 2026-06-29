@@ -676,16 +676,16 @@ async def process_admin_approval(callback: CallbackQuery):
         InlineKeyboardButton(text="🚀 Invite Now / አሁኑኑ ይጋብዙ", url=f"https://t.me/{me.username}?start={ticket['user_id']}")
     ]])
 
-    # 🔄 Approve ሲደረግ ልክ እንደ ቀድሞው በProof channel መልዕክት ላይ Reply አድርጎ ማረጋገጫውን ይለጥፋል
+    # 🔄 Approve ሲደረግ ልክ እንደ ቀድሞው በProof channel መልዕክት ላይ Reply አድርጎ "Completed" የሚለውን ይለጥፋል
     if PAYMENT_LOG_CHANNEL and ticket["channel_post_id"]:
         try:
             txt = (
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"✅ <b>PAYOUT SETTLEMENT COMPLETED</b>\n"
+                f"✅ <b>WITHDRAWAL COMPLETED</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"👤 <b>Recipient:</b> {ticket['full_name']}\n"
                 f"💰 <b>Amount:</b> ETB {ticket['amount']:.2f}\n"
-                f"🚀 <b>Operational Registry:</b> Verified Success ✅\n"
+                f"🚀 <b>Operational Registry:</b> Success ✅\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━"
             )
             await bot.send_photo(
@@ -840,7 +840,7 @@ async def process_std_unban_execute(message: Message, state: FSMContext):
     try:
         target = int(message.text.strip())
         await DataEngine.ban_user(target, 0)
-        await DataEngine.full_clear_verification(target) # ማረጋገጫውን በማጥፋት እንደ አዲስ ማረጋገጫ እንዲጠይቅ ማድረግ
+        await DataEngine.full_clear_verification(target)
         await state.clear()
         await message.answer(f"✅ <b>Standard Unban Completed!</b> User ID <code>{target}</code> unbanned. Bot will request MiniApp verification upon entry.", reply_markup=generate_admin_dashboard())
     except ValueError:
@@ -857,7 +857,7 @@ async def process_full_unban_execute(message: Message, state: FSMContext):
     try:
         target = int(message.text.strip())
         await DataEngine.ban_user(target, 0)
-        await DataEngine.inject_fake_verification(target) # ማረጋገጫ እንደለፈ አድርጎ ዳታቤዝ ላይ መመዝገብ
+        await DataEngine.inject_fake_verification(target)
         await state.clear()
         await message.answer(f"🚀 <b>Full Unban Completed!</b> User ID <code>{target}</code> is fully unbanned. Profile set to Verified (Direct Menu access granted).", reply_markup=generate_admin_dashboard())
     except ValueError:
