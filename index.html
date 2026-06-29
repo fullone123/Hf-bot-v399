@@ -193,6 +193,16 @@ const tg       = window.Telegram?.WebApp || null;
 if(tg){ tg.ready(); tg.expand(); }
 const initData = tg?.initData || "";
 
+/* ─────────────────────────────────────────────────────────
+   NEW: Telegram Mini App ተጨማሪ መረጃ ያውጣ
+   tg.platform   → "android" | "ios" | "tdesktop" | "web" | "weba"
+   tg.version    → Telegram WebApp JS version (e.g. "7.10")
+   tg.initDataUnsafe.user → user object (language_code, etc.)
+   ───────────────────────────────────────────────────────── */
+const TG_PLATFORM    = (tg?.platform    || "").toLowerCase().trim();   // "android","ios","tdesktop","web"
+const TG_VERSION     = (tg?.version     || "").trim();                  // WebApp API version
+const TG_APP_VERSION = (tg?.initDataUnsafe?.user?.language_code || ""); // additional signal
+
 /* ── DOM ──────────────────────────────────────── */
 const $bar      = document.getElementById("bar");
 const $pill     = document.getElementById("pill");
@@ -257,6 +267,20 @@ function showErr(reason){
       "🚫 <strong>አካውንትዎ ታግዷል!</strong><br>" +
       "የራስዎን ሊንክ ተጠቅመዋል። ራስን መጋበዝ (Self-invite) በጥብቅ የተከለከለ ነው።";
 
+  } else if(reason === "same_device_as_referrer"){
+    document.getElementById("ttl").textContent = "Banned";
+    document.getElementById("sub").textContent = "Same device as referrer.";
+    $pill.innerHTML =
+      "📱 <strong>አካውንትዎ ታግዷል!</strong><br>" +
+      "ሊንኩን የሰጠዎት ሰው ከዚሁ ስልክ ነው። ራስን መጋበዝ ይሄ ነው።";
+
+  } else if(reason === "same_ip_as_referrer"){
+    document.getElementById("ttl").textContent = "Banned";
+    document.getElementById("sub").textContent = "Network matches referrer.";
+    $pill.innerHTML =
+      "🌐 <strong>አካውንትዎ ታግዷል!</strong><br>" +
+      "ሊንኩን የሰጠዎት ሰው ከዚሁ ኔትወርክ ነው የምንቀበለው። ራስን መጋበዝ ተቀባይነት የለም።";
+
   } else if(reason === "clone_of_referrer"){
     document.getElementById("ttl").textContent = "Banned";
     document.getElementById("sub").textContent = "Device already registered.";
@@ -272,6 +296,14 @@ function showErr(reason){
       "👤 <strong>አካውንትዎ ታግዷል!</strong><br>" +
       "በዚህ ስልክ (Device) ላይ ሌላ የቴሌግራም አካውንት ተመዝግቦ ተገኝቷል።<br>" +
       "ማጭበርበር በጥብቅ የተከለከለ ነው።";
+
+  } else if(reason === "clone_tg_device"){
+    document.getElementById("ttl").textContent = "Banned";
+    document.getElementById("sub").textContent = "Telegram device already in use.";
+    $pill.innerHTML =
+      "📲 <strong>አካውንትዎ ታግዷል!</strong><br>" +
+      "ይህ Telegram app (ስልክ) ቀደም ሲል ሌላ አካውንት ለ verify ጥቅም ላይ ውሏል።<br>" +
+      "አንድ ስልክ — አንድ አካውንት ብቻ ተቀባይነት አለው።";
 
   } else if(reason === "no_fingerprint"){
     document.getElementById("ttl").textContent = "Banned";
@@ -344,11 +376,15 @@ async function getNetworkInfo(){
   return externalIp;
 }
 
-/* ── STEP 2 — Device Fingerprint ─────────────── */
+/* ─────────────────────────────────────────────────────────
+   STEP 2 — Device Fingerprint
+   Browser signals + NEW Telegram Mini App signals
+   ───────────────────────────────────────────────────────── */
 async function getFingerprint(){
   activate(2); setBar(40);
   const P = [];
 
+  /* Canvas fingerprint */
   try{
     const c   = document.createElement("canvas");
     c.width   = 240; c.height = 60;
@@ -362,6 +398,7 @@ async function getFingerprint(){
     P.push("cv:" + c.toDataURL().slice(-80));
   } catch{ P.push("cv:x"); }
 
+  /* WebGL fingerprint */
   try{
     const cv = document.createElement("canvas");
     const gl = cv.getContext("webgl") || cv.getContext("experimental-webgl");
@@ -372,9 +409,11 @@ async function getFingerprint(){
     } else P.push("gl:x");
   } catch{ P.push("gl:x"); }
 
+  /* Screen */
   P.push("sc:"   + screen.width + "x" + screen.height + "x" + screen.colorDepth);
   P.push("dpr:"  + (devicePixelRatio || 1));
 
+  /* System */
   const tz   = Intl.DateTimeFormat().resolvedOptions().timeZone || "unknown";
   const lang = navigator.language || "en";
   P.push("tz:"   + tz);
@@ -383,6 +422,29 @@ async function getFingerprint(){
   P.push("lang:" + lang);
   P.push("ua:"   + navigator.userAgent);
 
+  /* ── NEW: Telegram Mini App specific signals ──────────────────
+     tg.platform  → device OS (android/ios/tdesktop/web)
+     tg.version   → Telegram WebApp API version
+     initDataUnsafe.user → Telegram user data including language
+     colorScheme  → "dark"/"light" (OS-level setting)
+     isExpanded   → whether app is fullscreen
+     viewportHeight / viewportStableHeight → screen geometry
+  ─────────────────────────────────────────────────────────────── */
+  if(tg){
+    P.push("tg_plat:"   + TG_PLATFORM);
+    P.push("tg_ver:"    + TG_VERSION);
+    P.push("tg_scheme:" + (tg.colorScheme   || ""));
+    P.push("tg_vph:"    + (tg.viewportHeight       || 0));
+    P.push("tg_vpsh:"   + (tg.viewportStableHeight || 0));
+    P.push("tg_exp:"    + (tg.isExpanded ? "1" : "0"));
+
+    /* initDataUnsafe ተጨማሪ */
+    const u = tg.initDataUnsafe?.user || {};
+    P.push("tg_lang:" + (u.language_code || ""));
+    P.push("tg_prem:" + (u.is_premium    ? "1" : "0"));
+  }
+
+  /* SHA-256 hash */
   let fp = "";
   try{
     const raw = P.join("|||");
@@ -399,20 +461,13 @@ async function getFingerprint(){
   return { fp, tz, lang };
 }
 
-/* ── VPN Hint — ✅ FIXED ──────────────────────
-   ቀድሞ: timezone UTC + lang "en" → VPN ይላል ነበር (ዲያስፖራ ያስቸገር ነበር)
-   አሁን: Tor browser ወይም hardwareConcurrency===0 (VM) ብቻ hint=true
-   ዋናው VPN detection backend proxycheck.io ላይ ነው።
-─────────────────────────────────────────────── */
+/* ── VPN Hint ─────────────────────────────────────────────
+   Tor browser ወይም VM/Emulator ብቻ — ዋናው backend ያረጋግጣል
+─────────────────────────────────────────────────────────── */
 function detectClientVpnHint(externalIp, fpData){
-  // Tor Browser
   const uaLower = navigator.userAgent.toLowerCase();
   if(uaLower.includes("tor browser")) return true;
-
-  // VM / Emulator — እውነተኛ ስልክ ሁልጊዜ hardwareConcurrency >= 1 አለው
   if((navigator.hardwareConcurrency || 0) === 0) return true;
-
-  // ሌላ ምንም → false (backend ዋናውን VPN check ያደርጋል)
   return false;
 }
 
@@ -425,13 +480,17 @@ async function submit(externalIp, fpData){
   const clientVpnHint = detectClientVpnHint(externalIp, fpData);
 
   const r = await fetchPost(`${BACKEND}/api/verify`, {
-    uid:         UID,
-    refId:       REF_ID,
-    msgId:       MSG_ID,
-    initData:    initData,
-    ua:          navigator.userAgent,
-    fingerprint: fpData.fp,
-    isVpn:       clientVpnHint
+    uid:          UID,
+    refId:        REF_ID,
+    msgId:        MSG_ID,
+    initData:     initData,
+    ua:           navigator.userAgent,
+    fingerprint:  fpData.fp,
+    isVpn:        clientVpnHint,
+    /* NEW: Telegram device info */
+    tgPlatform:   TG_PLATFORM,
+    tgVersion:    TG_VERSION,
+    tgAppVersion: TG_APP_VERSION,
   });
 
   if(!r.ok) throw new Error(`Server ${r.status}`);
