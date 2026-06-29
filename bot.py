@@ -53,7 +53,7 @@ ADMIN_IDS            = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") i
 PAYMENT_LOG_CHANNEL  = os.getenv("PAYMENT_LOG_CHANNEL", "").strip()
 WEBAPP_URL           = os.getenv("WEBAPP_URL", "http://localhost:8000").rstrip("/")
 PROXYCHECK_API_KEY   = os.getenv("PROXYCHECK_API_KEY", "")
-ALLOWED_ORIGIN       = os.getenv("ALLOWED_ORIGIN", "").strip()   # e.g. https://yourapp.com
+ALLOWED_ORIGIN       = os.getenv("ALLOWED_ORIGIN", "").strip()
 DB_PATH              = "referral_bot.db"
 
 TELEBIRR_PROOF_IMAGE = "AgACAgQAAxkBAAO6akLJQYxDTMsMCF_TJ1mfprGQg9oAAqgOaxv6JBFSsp0Sw79o0x0BAAMCAAN4AAM4BA"
@@ -70,24 +70,19 @@ BOT_RULES_CAPTION = (
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RATE LIMITER  (in-memory — per IP)
+# RATE LIMITER
 # ─────────────────────────────────────────────────────────────────────────────
 class RateLimiter:
-    """
-    Sliding window rate limiter.
-    max_calls ጊዜ በ window_seconds ውስጥ ከዘለፈ 429 ይመለሳል።
-    """
     def __init__(self, max_calls: int = 5, window_seconds: int = 60):
         self.max_calls     = max_calls
         self.window        = window_seconds
-        self._calls: dict  = defaultdict(list)   # ip → [timestamp, ...]
+        self._calls: dict  = defaultdict(list)
         self._lock         = asyncio.Lock()
 
     async def is_allowed(self, key: str) -> bool:
         async with self._lock:
             now    = time.monotonic()
             bucket = self._calls[key]
-            # ያለፉ timestamps ያስወግድ
             bucket[:] = [t for t in bucket if now - t < self.window]
             if len(bucket) >= self.max_calls:
                 return False
@@ -177,13 +172,16 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE verifications ADD COLUMN tg_app_version TEXT DEFAULT ''",
 ]
 
+MIGRATION_STATEMENTS_V2 = [
+    "ALTER TABLE verifications ADD COLUMN canvas_hash TEXT DEFAULT ''",
+    "ALTER TABLE verifications ADD COLUMN webgl_hash  TEXT DEFAULT ''",
+    "ALTER TABLE verifications ADD COLUMN screen_sig  TEXT DEFAULT ''",
+]
+
 # ─────────────────────────────────────────────────────────────────────────────
-# HTML SANITIZER  (Telegram HTML parse mode injection መከላከል)
+# HTML SANITIZER
 # ─────────────────────────────────────────────────────────────────────────────
 def sanitize_html(text: str) -> str:
-    """
-    User input ቀጥታ HTML message ውስጥ ከመጠቀሙ በፊት escape ያደርጋል።
-    """
     if not text:
         return ""
     return (
@@ -204,7 +202,7 @@ class DataEngine:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.executescript(SCHEMA)
             await db.commit()
-            for stmt in MIGRATION_STATEMENTS:
+            for stmt in MIGRATION_STATEMENTS + MIGRATION_STATEMENTS_V2:
                 try:
                     await db.execute(stmt)
                     await db.commit()
@@ -295,13 +293,20 @@ class DataEngine:
         tg_platform: str = "",
         tg_version: str = "",
         tg_app_version: str = "",
+        canvas_hash: str = "",
+        webgl_hash: str = "",
+        screen_sig: str = "",
     ):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "INSERT OR REPLACE INTO verifications "
-                "(user_id, ip_address, user_agent, fingerprint, referrer_ip, tg_platform, tg_version, tg_app_version) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (user_id, ip, ua, fingerprint, referrer_ip, tg_platform, tg_version, tg_app_version),
+                "(user_id, ip_address, user_agent, fingerprint, referrer_ip, "
+                "tg_platform, tg_version, tg_app_version, "
+                "canvas_hash, webgl_hash, screen_sig) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (user_id, ip, ua, fingerprint, referrer_ip,
+                 tg_platform, tg_version, tg_app_version,
+                 canvas_hash, webgl_hash, screen_sig),
             )
             await db.commit()
 
@@ -330,17 +335,11 @@ class DataEngine:
             )
             await db.commit()
 
-    # ── FIX #1: Atomic withdrawal — double-spend ይከላከላል ────────────────────
     @staticmethod
     async def create_withdrawal_atomic(
         user_id: int, amount: float, full_name: str, phone: str
     ) -> tuple[int, bool]:
-        """
-        Balance deduction እና withdrawal creation አንድ transaction ውስጥ።
-        Returns (ticket_id, success).  success=False → insufficient funds።
-        """
         async with aiosqlite.connect(DB_PATH) as db:
-            # EXCLUSIVE lock — parallel requests ይዘጋሉ
             await db.execute("BEGIN EXCLUSIVE")
             try:
                 cur = await db.execute(
@@ -418,7 +417,7 @@ class DataEngine:
             await db.commit()
 
     _settings_cache: dict = {}
-    _settings_lock = asyncio.Lock()   # FIX: cache race condition
+    _settings_lock = asyncio.Lock()
 
     @staticmethod
     async def get_setting(key: str, default=None):
@@ -442,7 +441,7 @@ class DataEngine:
             await db.commit()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FRAUD DETECTION ENGINE  (ሙሉ ተሻሽሎ)
+# FRAUD DETECTION ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 async def evaluate_clone_risk(
     new_user_id: int,
@@ -456,25 +455,12 @@ async def evaluate_clone_risk(
     webgl_hash: str = "",
     screen_sig: str = "",
 ) -> tuple[bool, str]:
-    """
-    ሙሉ fraud detection:
-    1. Self-invite
-    2. Same IP as referrer  →  ban (ነገር ግን different fingerprint = log only)
-    3. Same device as referrer (IP + fingerprint match)
-    4. Clone of referrer (IP + fingerprint exact)
-    5. Clone of any existing user
-    6. Telegram device clone (platform + version + fingerprint)
-    7. NEW: canvas/webgl/screen hardware clone across different accounts
-    8. NEW: Same tg_app_version + fingerprint = same Telegram install
-    """
 
-    # ── 1. Self-invite ───────────────────────────────────────────
     if referrer_id and referrer_id == new_user_id:
         return True, "self_invite"
 
     ip_ok = client_ip and client_ip not in ("127.0.0.1", "::1", "unknown")
 
-    # ── 2 & 3. IP vs referrer ────────────────────────────────────
     if ip_ok and referrer_id:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -493,17 +479,13 @@ async def evaluate_clone_risk(
 
                     if fingerprint and inv_fp:
                         if inv_fp == fingerprint:
-                            # ሙሉ match → same device
                             return True, "same_device_as_referrer"
                         else:
-                            # IP ተመሳሳይ ፣ device ተለየ → WiFi ሊሆን ይችላል
-                            # log ብቻ — ban አይደለም
                             logger.warning(
                                 f"[FRAUD-WARN] Same IP diff device: "
                                 f"ref={referrer_id} new={new_user_id} ip={client_ip}"
                             )
                     else:
-                        # fingerprint ሌለ — IP ብቻ match → ጠያቂ
                         return True, "same_ip_as_referrer"
 
     if not ip_ok or not fingerprint:
@@ -512,7 +494,6 @@ async def evaluate_clone_risk(
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
-        # ── 4. Fingerprint + IP = referrer clone ─────────────────
         if referrer_id:
             cur = await db.execute(
                 "SELECT user_id FROM verifications "
@@ -522,7 +503,6 @@ async def evaluate_clone_risk(
             if await cur.fetchone():
                 return True, "clone_of_referrer"
 
-        # ── 5. Fingerprint + IP = any existing user ───────────────
         cur = await db.execute(
             "SELECT user_id FROM verifications "
             "WHERE ip_address = ? AND fingerprint = ? AND user_id != ? LIMIT 1",
@@ -531,7 +511,6 @@ async def evaluate_clone_risk(
         if await cur.fetchone():
             return True, "clone_of_existing"
 
-        # ── 6. Telegram device clone (platform + version + fp) ────
         if tg_platform and tg_version and fingerprint:
             cur = await db.execute(
                 "SELECT user_id FROM verifications "
@@ -548,9 +527,6 @@ async def evaluate_clone_risk(
                 )
                 return True, "clone_tg_device"
 
-        # ── 7. NEW: tg_app_version + fingerprint ──────────────────
-        #    ተመሳሳይ Telegram install (app_version) + ተመሳሳይ device fingerprint
-        #    = አንድ ስልክ ላይ ሁለት account
         if tg_app_version and fingerprint:
             cur = await db.execute(
                 "SELECT user_id FROM verifications "
@@ -567,9 +543,6 @@ async def evaluate_clone_risk(
                 )
                 return True, "clone_tg_install"
 
-        # ── 8. NEW: Canvas + WebGL hardware clone ─────────────────
-        #    ከ fingerprint ነጻ የሆነ hardware-level check።
-        #    Canvas hash ወይም WebGL hash ተመሳሳይ + IP ተቀራራቢ ከሆነ suspect።
         if canvas_hash and len(canvas_hash) > 8:
             cur = await db.execute(
                 "SELECT user_id FROM verifications "
@@ -578,7 +551,6 @@ async def evaluate_clone_risk(
             )
             row = await cur.fetchone()
             if row:
-                # canvas ብቻ ብዙ devices ላይ ሊደጋገም ይችላል — webgl ወይም IP ጋር ያዋህዳል
                 cur2 = await db.execute(
                     "SELECT user_id FROM verifications "
                     "WHERE canvas_hash = ? AND ip_address = ? AND user_id != ? LIMIT 1",
@@ -614,55 +586,6 @@ def extract_real_ip(request: Request) -> str:
     if request.client:
         return request.client.host
     return "unknown"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DATABASE SCHEMA — canvas/webgl column migration
-# ─────────────────────────────────────────────────────────────────────────────
-MIGRATION_STATEMENTS_V2 = [
-    "ALTER TABLE verifications ADD COLUMN canvas_hash TEXT DEFAULT ''",
-    "ALTER TABLE verifications ADD COLUMN webgl_hash  TEXT DEFAULT ''",
-    "ALTER TABLE verifications ADD COLUMN screen_sig  TEXT DEFAULT ''",
-]
-
-# DataEngine.init_database ን override ያደርጋል
-_orig_init = DataEngine.init_database.__func__
-
-async def _patched_init():
-    await _orig_init()
-    async with aiosqlite.connect(DB_PATH) as db:
-        for stmt in MIGRATION_STATEMENTS_V2:
-            try:
-                await db.execute(stmt)
-                await db.commit()
-            except Exception:
-                pass
-
-DataEngine.init_database = staticmethod(_patched_init)
-
-# save_verification ን override — canvas/webgl ጨምር
-_orig_save = DataEngine.save_verification.__func__
-
-async def _patched_save_verification(
-    user_id: int, ip: str, ua: str, fingerprint: str,
-    referrer_ip: str = "", tg_platform: str = "",
-    tg_version: str = "", tg_app_version: str = "",
-    canvas_hash: str = "", webgl_hash: str = "", screen_sig: str = "",
-):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO verifications "
-            "(user_id, ip_address, user_agent, fingerprint, referrer_ip, "
-            "tg_platform, tg_version, tg_app_version, "
-            "canvas_hash, webgl_hash, screen_sig) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (user_id, ip, ua, fingerprint, referrer_ip,
-             tg_platform, tg_version, tg_app_version,
-             canvas_hash, webgl_hash, screen_sig),
-        )
-        await db.commit()
-
-DataEngine.save_verification = staticmethod(_patched_save_verification)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -976,7 +899,7 @@ def generate_fallback_navigation(target="ui_return_home") -> InlineKeyboardMarku
     ]])
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WITHDRAWAL  (FIX #1: atomic transaction)
+# WITHDRAWAL
 # ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "ui_initiate_withdrawal")
 async def process_withdrawal_start(callback: CallbackQuery, state: FSMContext):
@@ -1043,7 +966,6 @@ async def process_account_title(message: Message, state: FSMContext):
         return await message.answer("❌ Name is too short.")
     await state.update_data(validated_title=title)
     s = await state.get_data()
-    # FIX #4: sanitize user input before HTML display
     safe_title = sanitize_html(title)
     await message.answer(
         f"⚠️ <b>Review Settlement Details</b>\n\n"
@@ -1064,7 +986,6 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
     s   = await state.get_data()
     uid = callback.from_user.id
 
-    # FIX #1: atomic transaction — double-spend ይከላከላል
     tid, ok = await DataEngine.create_withdrawal_atomic(
         uid, s["validated_volume"], s["validated_title"], s["validated_phone"]
     )
@@ -1102,7 +1023,6 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
 
     direct_ref, tier2_ref = await DataEngine.get_referral_metrics(uid)
     alias_str  = f"@{sanitize_html(user['username'])}" if user["username"] else "None"
-    # FIX #4: all user inputs sanitized
     admin_txt = (
         f"📥 <b>Incoming Ticket #{tid}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1288,7 +1208,7 @@ async def execute_withdrawal_rejection(msg_obj, tid, ticket, reason):
         await msg_obj.edit_text(reply_text, reply_markup=generate_admin_dashboard())
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ADMIN — PANEL & SETTINGS (unchanged logic, sanitize added where needed)
+# ADMIN — PANEL & SETTINGS
 # ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "ui_admin_core")
 async def process_admin_panel(callback: CallbackQuery):
@@ -1673,12 +1593,11 @@ async def application_lifespan(app: FastAPI):
 api_platform = FastAPI(lifespan=application_lifespan)
 dp.include_router(core_router)
 
-# FIX #3: CORS — specific origin ብቻ (wildcard አይደለም)
 _cors_origins = [ALLOWED_ORIGIN] if ALLOWED_ORIGIN else ["*"]
 api_platform.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_credentials=bool(ALLOWED_ORIGIN),  # specific origin ካለ ብቻ True
+    allow_credentials=bool(ALLOWED_ORIGIN),
     allow_methods=["POST", "GET"],
     allow_headers=["Content-Type"],
 )
@@ -1696,12 +1615,11 @@ async def serve_frontend(uid: int = 0, ref: int = 0, msg_id: int = 0):
         raise HTTPException(status_code=500, detail=f"Frontend missing: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI — VERIFICATION ENDPOINT  (ሁሉም fixes ተጨምረዋል)
+# FASTAPI — VERIFICATION ENDPOINT
 # ─────────────────────────────────────────────────────────────────────────────
 @api_platform.post("/api/verify")
 async def execute_verification(request: Request):
 
-    # ── FIX #2: Rate limiting ──────────────────────────────────────────────
     client_ip = extract_real_ip(request)
     if not await verify_limiter.is_allowed(client_ip):
         logger.warning(f"[RATE-LIMIT] ip={client_ip}")
@@ -1715,22 +1633,13 @@ async def execute_verification(request: Request):
     uid    = int(tg_user["id"])
     ref_id = int(data.get("refId") or 0)
 
-    # ── FIX #5: msg_id server-side validation ─────────────────────────────
-    #   client ከሚልከው msg_id ፋንታ server ራሱ ያሰሌዋል — arbitrary deletion ይቆማል።
-    #   msg_id ከ 0 ጋር ሲስማማ ብቻ ነው የሚሰረዘው (valid positive integer)
     raw_msg_id = int(data.get("msgId") or 0)
     msg_id     = raw_msg_id if raw_msg_id > 0 else 0
-    # msg_id ን validate — ተጠቃሚው ለ verification ላከ መሆን አለበት
-    # (ስርዓቱ ከ bot ውስጥ ያቀናበረው ID ካልሆነ አይሰርዝም)
-    if msg_id > 0:
-        # bot ከ bot chat ጋር ብቻ — group/channel IDs ሊልኩ አይችሉም
-        pass  # flow continues; deletion happens below after all checks pass
 
     tg_platform    = str(data.get("tgPlatform",    "")).strip()[:50]
     tg_version     = str(data.get("tgVersion",     "")).strip()[:30]
     tg_app_version = str(data.get("tgAppVersion",  "")).strip()[:30]
 
-    # ── NEW: canvas/webgl/screen hashes ───────────────────────────────────
     canvas_hash = str(data.get("canvasHash",  "")).strip()[:64]
     webgl_hash  = str(data.get("webglHash",   "")).strip()[:64]
     screen_sig  = str(data.get("screenSig",   "")).strip()[:32]
@@ -1755,7 +1664,6 @@ async def execute_verification(request: Request):
         await DataEngine.ban_user(uid, 1)
         return JSONResponse({"status": "blocked", "reason": "banned_ip"})
 
-    # ── Clone risk evaluation (ሙሉ) ────────────────────────────────────────
     should_ban, ban_reason = await evaluate_clone_risk(
         new_user_id=uid,
         referrer_id=ref_id,
@@ -1771,7 +1679,6 @@ async def execute_verification(request: Request):
     if should_ban:
         await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
         await DataEngine.ban_user(uid, 1)
-        # IP ን ብሎ ያግደው
         await DataEngine.ban_ip(client_ip, f"clone_detect:{ban_reason}")
         if msg_id > 0:
             try: await bot.delete_message(chat_id=uid, message_id=msg_id)
@@ -1788,7 +1695,6 @@ async def execute_verification(request: Request):
         try: await bot.delete_message(chat_id=uid, message_id=msg_id)
         except Exception: pass
 
-    # ── referrer IP ─────────────────────────────────────────────────────
     referrer_ip = ""
     if ref_id and ref_id != uid:
         ref_verif = await DataEngine.get_verification(ref_id)
