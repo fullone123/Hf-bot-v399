@@ -52,8 +52,6 @@ WEBAPP_URL           = os.getenv("WEBAPP_URL", "http://localhost:8000").rstrip("
 PROXYCHECK_API_KEY   = os.getenv("PROXYCHECK_API_KEY", "")
 DB_PATH              = "referral_bot.db"
 
-TELEBIRR_PROOF_IMAGE = "AgACAgQAAxkBAAOYai38ooud5iofBd3aDGuCiX273t8AAj4PaxsYl3BR78MpfA_cDpkBAAMCAAN4AAM8BA"
-
 if not WEBAPP_URL.startswith(("http://", "https://")):
     WEBAPP_URL = f"https://{WEBAPP_URL}"
 
@@ -245,7 +243,7 @@ class DataEngine:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT * FROM withdrawals WHERE status='pending' ORDER BY created_at")
-            return await run.fetchall() if hasattr(cur, 'fetchall') else await cur.fetchall()
+            return await cur.fetchall()
 
     @staticmethod
     async def add_force_channel(channel_id: str, channel_name: str, invite_link: str, bot_added: int = 0):
@@ -453,60 +451,6 @@ def generate_fallback_navigation(target="ui_return_home") -> InlineKeyboardMarku
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back / ተመለስ", callback_data=target)]])
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TELEGRAM BOT HANDLERS
-# ─────────────────────────────────────────────────────────────────────────────
-@core_router.message(CommandStart())
-async def process_start_command(message: Message, state: FSMContext):
-    await state.clear()
-    uid  = message.from_user.id
-    args = message.text.split()
-    arg  = args[1] if len(args) > 1 else ""
-    ref  = int(arg) if arg.isdigit() and int(arg) != uid else 0
-
-    acc = await DataEngine.get_user(uid)
-    if acc and acc["is_banned"]:
-        return await message.answer("🚫 <b>Banned:</b> Your profile has been blacklisted.")
-
-    if not await enforce_membership_gate(message, uid):
-        if ref: await state.update_data(stashed_referrer_id=ref)
-        return
-
-    if await DataEngine.is_verified(uid):
-        return await message.answer("✅ <b>Welcome back!</b> Access granted.", reply_markup=generate_dashboard_matrix(uid))
-
-    sent = await message.answer(f"{BOT_RULES_CAPTION}\n\n🔐 <b>Next Step:</b> Verify identity via Mini App:", reply_markup=generate_verification_widget(uid, ref, 0))
-    await sent.edit_reply_markup(reply_markup=generate_verification_widget(uid, ref, sent.message_id))
-
-@core_router.callback_query(F.data == "ui_return_home")
-async def process_navigation_home(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    if not await enforce_membership_gate(callback, callback.from_user.id): return
-    await callback.message.edit_text("🏠 <b>Main Dashboard Menu / ዋና ማውጫ</b>", reply_markup=generate_dashboard_matrix(callback.from_user.id))
-
-@core_router.callback_query(F.data == "ui_fetch_balance")
-async def process_balance_query(callback: CallbackQuery):
-    if not await enforce_membership_gate(callback, callback.from_user.id): return
-    acc   = await DataEngine.get_user(callback.from_user.id)
-    min_w = await DataEngine.get_setting("min_withdrawal", "50")
-    await callback.message.edit_text(f"💰 <b>Your Available Balance:</b>\n\n• Assets: <code>{float(acc['balance']):.2f} Birr</code>\n• Minimum Withdrawal: <code>{float(min_w):.2f} Birr</code>", reply_markup=generate_fallback_navigation())
-
-@core_router.callback_query(F.data == "ui_fetch_referrals")
-async def process_referral_query(callback: CallbackQuery):
-    if not await enforce_membership_gate(callback, callback.from_user.id): return
-    uid  = callback.from_user.id
-    direct, _ = await DataEngine.get_referral_metrics(uid)
-    rate = float(await DataEngine.get_setting("reward_per_referral", "10"))
-    me   = await bot.get_me()
-    link = f"https://t.me/{me.username}?start={uid}"
-    await callback.message.edit_text(f"👥 <b>Your Referral Network:</b>\n\n• Total Referrals: <b>{direct} users</b>\n• Earnings per Referral: <b>{rate:.2f} Birr</b>\n• Total Earned: <b>{float(direct * rate):.2f} Birr</b>\n\n🔗 Your link:\n<code>{link}</code>", reply_markup=generate_fallback_navigation())
-
-@core_router.callback_query(F.data == "ui_fetch_link")
-async def process_link_generation(callback: CallbackQuery):
-    if not await enforce_membership_gate(callback, callback.from_user.id): return
-    me = await bot.get_me()
-    await callback.message.edit_text(f"🔗 <b>Your Invite Link / መጋበዣ ሊንክ:</b>\n\n<code>https://t.me/{me.username}?start={callback.from_user.id}</code>", reply_markup=generate_fallback_navigation())
-
-# ─────────────────────────────────────────────────────────────────────────────
 # WITHDRAWAL CORE LOGIC & PROOF CHANNEL INTEGRATION
 # ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "ui_initiate_withdrawal")
@@ -536,7 +480,6 @@ async def process_cashout_volume(message: Message, state: FSMContext):
     s = await state.get_data()
     try:
         val = round(float(message.text.strip()), 2)
-        # 💸 የተሳሳተ ባላንስ ሲያስገባ መልዕክቱ Your balance is እንዲል ተደርጓል!
         if val < s["cached_minimum"] or val > s["cached_balance"]:
             return await message.answer(f"❌ Invalid amount. Minimum withdrawal is {s['cached_minimum']:.2f} ETB.\n⚠️ <b>Your balance is:</b> {s['cached_balance']:.2f} ETB.")
     except Exception:
@@ -583,7 +526,6 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
     await state.clear()
 
     me = await bot.get_me()
-    # 🚀 በተኑ ላይ ያለው አማርኛ ጠፍቶ "🚀 Invite Now" ብቻ ሆኗል
     proof_channel_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}?start={uid}")
     ]])
@@ -591,7 +533,6 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
     post_id = 0
     if PAYMENT_LOG_CHANNEL:
         try:
-            # ✨ የጽሁፍ ውበት እንዲኖረው Space (የመስመር ነፃ ቦታዎች) ተጨምረዋል
             txt = (
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"📥 <b>NEW WITHDRAWAL REQUEST</b>\n\n"
@@ -663,7 +604,7 @@ async def process_admin_view_invites(callback: CallbackQuery):
     await callback.answer()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ADMIN APPROVE MANAGEMENT (Edit Message Layout - Fixed)
+# ADMIN APPROVE MANAGEMENT (Fixed: Posts a completely new Reply Message instead of Edit)
 # ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data.startswith("adm_payout_ap_"))
 async def process_admin_approval(callback: CallbackQuery):
@@ -675,15 +616,13 @@ async def process_admin_approval(callback: CallbackQuery):
     await DataEngine.update_withdrawal_status(tid, "approved", ticket["channel_post_id"])
     
     me = await bot.get_me()
-    # 🚀 በተኑ ላይ ያለው አማርኛ ጠፍቶ "🚀 Invite Now" ብቻ ሆኗል
     proof_channel_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}?start={ticket['user_id']}")
     ]])
 
-    # 🔄 አዲስ ፖስት ሳይሆን የድሮውን ጽሁፍ በፎቶው ላይ "Completed" ብሎ Edit ብቻ ያደርጋል!
+    # 🔥 እዚህ ጋ ነው የተቀየረው! አዲሱ Completed ፖስት ለድሮው Request ፖስት በ Reply መልዕክት እንዲላክ ተደርጓል
     if PAYMENT_LOG_CHANNEL and ticket["channel_post_id"]:
         try:
-            # ✨ ማራኪ እንዲሆን በመካከላቸው የ space ክፍተት ተጨምሯል
             txt = (
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"✅ <b>WITHDRAWAL COMPLETED</b>\n\n"
@@ -693,14 +632,14 @@ async def process_admin_approval(callback: CallbackQuery):
                 f"🚀 <b>Operational Registry:</b> Success ✅\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━"
             )
-            await bot.edit_message_caption(
+            await bot.send_message(
                 chat_id=PAYMENT_LOG_CHANNEL,
-                message_id=ticket["channel_post_id"],
-                caption=txt,
+                text=txt,
+                reply_to_message_id=ticket["channel_post_id"], # ለድሮው ፖስት በ Reply ይላካል!
                 reply_markup=proof_channel_keyboard
             )
         except Exception as e:
-            logger.error(f"Proof Channel Edit Caption Error: {e}")
+            logger.error(f"Proof Channel Reply Post Error: {e}")
             
     try: await bot.send_message(ticket["user_id"], f"🎉 Your cashout of {ticket['amount']:.2f} Birr has been successfully approved and sent via Telebirr!")
     except Exception: pass
@@ -777,98 +716,7 @@ async def execute_withdrawal_rejection(msg_obj, tid, ticket, reason):
         await msg_obj.edit_text(f"✅ Ticket #{tid} rejected. User notified in private mode. No channel post made.", reply_markup=generate_admin_dashboard())
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BROADCAST ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
-@core_router.callback_query(F.data == "adm_cmd_broadcast")
-async def process_broadcast_start(callback: CallbackQuery, state: FSMContext):
-    if not evaluate_admin_access(callback.from_user.id): return
-    await state.set_state(AdminConsoleWorkflow.broadcast_intel_payload)
-    await callback.message.edit_text("📢 <b>Enter Broadcast Payload Text (የሚላከውን ጽሁፍ ያስገቡ):</b>", reply_markup=generate_fallback_navigation("ui_admin_core"))
-
-@core_router.message(AdminConsoleWorkflow.broadcast_intel_payload)
-async def process_broadcast_preview(message: Message, state: FSMContext):
-    text = message.text
-    await state.update_data(bc_payload=text)
-    await state.set_state(AdminConsoleWorkflow.broadcast_confirmation)
-    
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 አሁን አሰራጭ (Send Now)", callback_data="bc_action_confirm")],
-        [InlineKeyboardButton(text="✍️ መልዕክቱን ቀይር (Edit)", callback_data="adm_cmd_broadcast")],
-        [InlineKeyboardButton(text="❌ ሰርዝ (Cancel)", callback_data="ui_admin_core")]
-    ])
-    await message.answer(f"📝 <b>የመልዕክት ቅድመ-ዕይታ (Preview):</b>\n\n{text}\n\n⚠️ እርግጠኛ ነዎት ይህ መልዕክት ለሁሉም ተጠቃሚዎች እንዲሰራጭ ይፈልጋሉ?", reply_markup=markup)
-
-@core_router.callback_query(F.data == "bc_action_confirm", AdminConsoleWorkflow.broadcast_confirmation)
-async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
-    s = await state.get_data()
-    text = s["bc_payload"]
-    await state.clear()
-    
-    progress = await callback.message.edit_text("⏳ Dispersing broadcast vectors... እባክዎ ይጠብቁ...")
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id FROM users")
-        nodes = await cur.fetchall()
-        
-    sc = 0
-    for (uid,) in nodes:
-        try:
-            await bot.send_message(uid, text)
-            sc += 1
-            await asyncio.sleep(0.04)
-        except Exception: pass
-        
-    await progress.delete()
-    await callback.message.answer(f"✅ Transmission secure. Sent to {sc} active nodes.", reply_markup=generate_admin_dashboard())
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ADVANCED UNBAN ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
-@core_router.callback_query(F.data == "adm_cmd_unban_menu")
-async def process_unban_dashboard(callback: CallbackQuery):
-    if not evaluate_admin_access(callback.from_user.id): return
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Standard Unban (Requires MiniApp)", callback_data="unban_trigger_std")],
-        [InlineKeyboardButton(text="🔥 Full Unban (Bypass MiniApp - Direct Menu)", callback_data="unban_trigger_full")],
-        [InlineKeyboardButton(text="🔙 Back", callback_data="ui_admin_core")]
-    ])
-    await callback.message.edit_text("🔓 <b>የመፍቻ አይነት ይምረጡ / Select Unban Method:</b>\n\n• <b>Standard Unban:</b> እገዳውን ያነሳል፣ ነገር ግን ልክ እንደ መጀመሪያው ሲገባ የMini App ማረጋገጫ (Verification) ይጠይቃል።\n• <b>Full Unban:</b> ተጠቃሚውን ሙሉ በሙሉ ነፃ ያደርገዋል (Verification Passed)፤ ወደ ቦቱ ሲመለስ ምንም ማረጋገጫ ሳይጠይቅ በቀጥታ ወደ **ዋናው ማውጫ (Menu)** ይወስደዋል።", reply_markup=markup)
-
-@core_router.callback_query(F.data == "unban_trigger_std")
-async def process_std_unban_start(callback: CallbackQuery, state: FSMContext):
-    if not evaluate_admin_access(callback.from_user.id): return
-    await state.set_state(AdminConsoleWorkflow.pardon_individual_std)
-    await callback.message.edit_text("👤 <b>[Standard Unban] Enter Telegram User ID (Will request MiniApp Verification):</b>", reply_markup=generate_fallback_navigation("adm_cmd_unban_menu"))
-
-@core_router.message(AdminConsoleWorkflow.pardon_individual_std)
-async def process_std_unban_execute(message: Message, state: FSMContext):
-    try:
-        target = int(message.text.strip())
-        await DataEngine.ban_user(target, 0)
-        await DataEngine.full_clear_verification(target)
-        await state.clear()
-        await message.answer(f"✅ <b>Standard Unban Completed!</b> User ID <code>{target}</code> unbanned. Bot will request MiniApp verification upon entry.", reply_markup=generate_admin_dashboard())
-    except ValueError:
-        await message.answer("❌ Please provide a valid numeric User ID.")
-
-@core_router.callback_query(F.data == "unban_trigger_full")
-async def process_full_unban_start(callback: CallbackQuery, state: FSMContext):
-    if not evaluate_admin_access(callback.from_user.id): return
-    await state.set_state(AdminConsoleWorkflow.pardon_individual_full)
-    await callback.message.edit_text("🔥 <b>[Full Unban] Enter Telegram User ID (Bypasses MiniApp - Direct Menu Access):</b>", reply_markup=generate_fallback_navigation("adm_cmd_unban_menu"))
-
-@core_router.message(AdminConsoleWorkflow.pardon_individual_full)
-async def process_full_unban_execute(message: Message, state: FSMContext):
-    try:
-        target = int(message.text.strip())
-        await DataEngine.ban_user(target, 0)
-        await DataEngine.inject_fake_verification(target)
-        await state.clear()
-        await message.answer(f"🚀 <b>Full Unban Completed!</b> User ID <code>{target}</code> is fully unbanned. Profile set to Verified (Direct Menu access granted).", reply_markup=generate_admin_dashboard())
-    except ValueError:
-        await message.answer("❌ Please provide a valid numeric User ID.")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ADMIN CONSOLE OPERATIONS & SYSTEM LIFECYCLE
+# SYSTEM MANAGEMENT & FRONTEND API ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "ui_admin_core")
 async def process_admin_panel(callback: CallbackQuery):
@@ -1061,6 +909,91 @@ async def process_pending_inventory(callback: CallbackQuery):
     if not pending: return await callback.message.edit_text("📭 No pending withdrawals.", reply_markup=generate_fallback_navigation("ui_admin_core"))
     lines = [f"• <b>#{t['id']}</b> — {t['full_name']} — <code>{float(t['amount']):.2f} ETB</code>" for t in pending]
     await callback.message.edit_text(f"📥 <b>Pending Withdrawal Withdrawal Inventory ({len(pending)})</b>\n\n" + "\n".join(lines), reply_markup=generate_fallback_navigation("ui_admin_core"))
+
+@core_router.callback_query(F.data == "adm_cmd_broadcast")
+async def process_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    if not evaluate_admin_access(callback.from_user.id): return
+    await state.set_state(AdminConsoleWorkflow.broadcast_intel_payload)
+    await callback.message.edit_text("📢 <b>Enter Broadcast Payload Text (የሚላከውን ጽሁፍ ያስገቡ):</b>", reply_markup=generate_fallback_navigation("ui_admin_core"))
+
+@core_router.message(AdminConsoleWorkflow.broadcast_intel_payload)
+async def process_broadcast_preview(message: Message, state: FSMContext):
+    text = message.text
+    await state.update_data(bc_payload=text)
+    await state.set_state(AdminConsoleWorkflow.broadcast_confirmation)
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 አሁን አሰራጭ (Send Now)", callback_data="bc_action_confirm")],
+        [InlineKeyboardButton(text="✍️ መልዕክቱን ቀይር (Edit)", callback_data="adm_cmd_broadcast")],
+        [InlineKeyboardButton(text="❌ ሰርዝ (Cancel)", callback_data="ui_admin_core")]
+    ])
+    await message.answer(f"📝 <b>የመልዕክት ቅድመ-ዕይታ (Preview):</b>\n\n{text}\n\n⚠️ እርግጠኛ ነዎት ይህ መልዕክት ለሁሉም ተጠቃሚዎች እንዲሰራጭ ይፈልጋሉ?", reply_markup=markup)
+
+@core_router.callback_query(F.data == "bc_action_confirm", AdminConsoleWorkflow.broadcast_confirmation)
+async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
+    s = await state.get_data()
+    text = s["bc_payload"]
+    await state.clear()
+    
+    progress = await callback.message.edit_text("⏳ Dispersing broadcast vectors... እባክዎ ይጠብቁ...")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM users")
+        nodes = await cur.fetchall()
+        
+    sc = 0
+    for (uid,) in nodes:
+        try:
+            await bot.send_message(uid, text)
+            sc += 1
+            await asyncio.sleep(0.04)
+        except Exception: pass
+        
+    await progress.delete()
+    await callback.message.answer(f"✅ Transmission secure. Sent to {sc} active nodes.", reply_markup=generate_admin_dashboard())
+
+@core_router.callback_query(F.data == "adm_cmd_unban_menu")
+async def process_unban_dashboard(callback: CallbackQuery):
+    if not evaluate_admin_access(callback.from_user.id): return
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Standard Unban (Requires MiniApp)", callback_data="unban_trigger_std")],
+        [InlineKeyboardButton(text="🔥 Full Unban (Bypass MiniApp - Direct Menu)", callback_data="unban_trigger_full")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data="ui_admin_core")]
+    ])
+    await callback.message.edit_text("🔓 <b>የመፍቻ አይነት ይምረጡ / Select Unban Method:</b>\n\n• <b>Standard Unban:</b> እገዳውን ያነሳል፣ ነገር ግን ልክ እንደ መጀመሪያው ሲገባ የMini App ማረጋገጫ (Verification) ይጠይቃል።\n• <b>Full Unban:</b> ተጠቃሚውን ሙሉ በሙሉ ነፃ ያደርገዋል (Verification Passed)፤ ወደ ቦቱ ሲመለስ ምንም ማረጋገጫ ሳይጠይቅ በቀጥታ ወደ **ዋናው ማውጫ (Menu)** ይወስደዋል።", reply_markup=markup)
+
+@core_router.callback_query(F.data == "unban_trigger_std")
+async def process_std_unban_start(callback: CallbackQuery, state: FSMContext):
+    if not evaluate_admin_access(callback.from_user.id): return
+    await state.set_state(AdminConsoleWorkflow.pardon_individual_std)
+    await callback.message.edit_text("👤 <b>[Standard Unban] Enter Telegram User ID (Will request MiniApp Verification):</b>", reply_markup=generate_fallback_navigation("adm_cmd_unban_menu"))
+
+@core_router.message(AdminConsoleWorkflow.pardon_individual_std)
+async def process_std_unban_execute(message: Message, state: FSMContext):
+    try:
+        target = int(message.text.strip())
+        await DataEngine.ban_user(target, 0)
+        await DataEngine.full_clear_verification(target)
+        await state.clear()
+        await message.answer(f"✅ <b>Standard Unban Completed!</b> User ID <code>{target}</code> unbanned. Bot will request MiniApp verification upon entry.", reply_markup=generate_admin_dashboard())
+    except ValueError:
+        await message.answer("❌ Please provide a valid numeric User ID.")
+
+@core_router.callback_query(F.data == "unban_trigger_full")
+async def process_full_unban_start(callback: CallbackQuery, state: FSMContext):
+    if not evaluate_admin_access(callback.from_user.id): return
+    await state.set_state(AdminConsoleWorkflow.pardon_individual_full)
+    await callback.message.edit_text("🔥 <b>[Full Unban] Enter Telegram User ID (Bypasses MiniApp - Direct Menu Access):</b>", reply_markup=generate_fallback_navigation("adm_cmd_unban_menu"))
+
+@core_router.message(AdminConsoleWorkflow.pardon_individual_full)
+async def process_full_unban_execute(message: Message, state: FSMContext):
+    try:
+        target = int(message.text.strip())
+        await DataEngine.ban_user(target, 0)
+        await DataEngine.inject_fake_verification(target)
+        await state.clear()
+        await message.answer(f"🚀 <b>Full Unban Completed!</b> User ID <code>{target}</code> is fully unbanned. Profile set to Verified (Direct Menu access granted).", reply_markup=generate_admin_dashboard())
+    except ValueError:
+        await message.answer("❌ Please provide a valid numeric User ID.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FASTAPI APP & LIFESPAN MANAGEMENT
