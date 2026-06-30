@@ -36,8 +36,8 @@ from aiogram.types import (
     WebAppInfo
 )
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
@@ -62,6 +62,11 @@ WEBAPP_URL           = os.getenv("WEBAPP_URL", "http://localhost:8000").rstrip("
 PROXYCHECK_API_KEY   = os.getenv("PROXYCHECK_API_KEY", "")
 ALLOWED_ORIGIN       = os.getenv("ALLOWED_ORIGIN", "").strip()
 DB_PATH              = "referral_bot.db"
+
+# ── Web Admin Dashboard auth ────────────────────────────────────────────────
+ADMIN_PASSWORD       = os.getenv("ADMIN_PASSWORD", "")
+_ADMIN_SESSION_KEY   = hashlib.sha256((BOT_TOKEN + ":" + ADMIN_PASSWORD).encode()).digest()
+ADMIN_SESSION_HOURS  = 12
 
 TELEBIRR_PROOF_IMAGE = "AgACAgQAAxkBAAO6akLJQYxDTMsMCF_TJ1mfprGQg9oAAqgOaxv6JBFSsp0Sw79o0x0BAAMCAAN4AAM4BA"
 
@@ -528,6 +533,79 @@ class DataEngine:
             return await cur.fetchall()
 
     @staticmethod
+    async def get_withdrawals_filtered(status: str = "all", limit: int = 100):
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            if status == "all":
+                cur = await db.execute(
+                    "SELECT * FROM withdrawals ORDER BY created_at DESC LIMIT ?", (limit,)
+                )
+            else:
+                cur = await db.execute(
+                    "SELECT * FROM withdrawals WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                    (status, limit),
+                )
+            return await cur.fetchall()
+
+    @staticmethod
+    async def get_all_users(search: str = "", limit: int = 50, offset: int = 0):
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            if search:
+                like = f"%{search}%"
+                if search.isdigit():
+                    cur = await db.execute(
+                        "SELECT * FROM users WHERE user_id = ? OR username LIKE ? OR full_name LIKE ? "
+                        "ORDER BY joined_at DESC LIMIT ? OFFSET ?",
+                        (int(search), like, like, limit, offset),
+                    )
+                    cur_count = await db.execute(
+                        "SELECT COUNT(*) FROM users WHERE user_id = ? OR username LIKE ? OR full_name LIKE ?",
+                        (int(search), like, like),
+                    )
+                else:
+                    cur = await db.execute(
+                        "SELECT * FROM users WHERE username LIKE ? OR full_name LIKE ? "
+                        "ORDER BY joined_at DESC LIMIT ? OFFSET ?",
+                        (like, like, limit, offset),
+                    )
+                    cur_count = await db.execute(
+                        "SELECT COUNT(*) FROM users WHERE username LIKE ? OR full_name LIKE ?",
+                        (like, like),
+                    )
+            else:
+                cur = await db.execute(
+                    "SELECT * FROM users ORDER BY joined_at DESC LIMIT ? OFFSET ?", (limit, offset)
+                )
+                cur_count = await db.execute("SELECT COUNT(*) FROM users")
+
+            rows  = await cur.fetchall()
+            total = (await cur_count.fetchone())[0] or 0
+            return rows, total
+
+    @staticmethod
+    async def get_bot_stats():
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur  = await db.execute("SELECT COUNT(*), SUM(balance) FROM users")
+            row  = await cur.fetchone()
+            cur2 = await db.execute("SELECT COUNT(*) FROM banned_ips")
+            ip_count = (await cur2.fetchone())[0] or 0
+            cur3 = await db.execute("SELECT COUNT(*) FROM fraud_log")
+            fraud_count = (await cur3.fetchone())[0] or 0
+            cur4 = await db.execute("SELECT COUNT(*) FROM withdrawals WHERE status='pending'")
+            pending_count = (await cur4.fetchone())[0] or 0
+            cur5 = await db.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1")
+            banned_users = (await cur5.fetchone())[0] or 0
+            return {
+                "registered_users": row[0] or 0,
+                "outstanding_liabilities": float(row[1] or 0.0),
+                "banned_ips": ip_count,
+                "fraud_log_entries": fraud_count,
+                "pending_withdrawals": pending_count,
+                "banned_users": banned_users,
+            }
+
+    @staticmethod
     async def add_force_channel(channel_id: str, channel_name: str, invite_link: str, bot_added: int = 0):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
@@ -807,6 +885,41 @@ def extract_real_ip(request: Request) -> str:
     if request.client:
         return request.client.host
     return "unknown"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WEB ADMIN DASHBOARD — AUTH
+#
+# Single shared password (ADMIN_PASSWORD env var), no DB / no per-user
+# accounts. On successful login we hand back a signed cookie token —
+# "<expiry_timestamp>.<hmac_signature>" — and verify it on every protected
+# request. There's nothing to store server-side, so a redeploy/restart
+# doesn't log anyone out, and an attacker without ADMIN_PASSWORD can't forge
+# a valid signature.
+# ─────────────────────────────────────────────────────────────────────────────
+def create_admin_session_token() -> str:
+    expiry = str(int(time.time()) + ADMIN_SESSION_HOURS * 3600)
+    sig = hmac.new(_ADMIN_SESSION_KEY, expiry.encode(), hashlib.sha256).hexdigest()
+    return f"{expiry}.{sig}"
+
+def verify_admin_session_token(token: str) -> bool:
+    if not token or "." not in token:
+        return False
+    expiry, _, sig = token.partition(".")
+    try:
+        if int(expiry) < int(time.time()):
+            return False
+    except ValueError:
+        return False
+    expected_sig = hmac.new(_ADMIN_SESSION_KEY, expiry.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected_sig)
+
+def require_admin_session(request: Request):
+    if not ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="ADMIN_PASSWORD not configured on the server.")
+    token = request.cookies.get("admin_session", "")
+    if not verify_admin_session_token(token):
+        raise HTTPException(status_code=401, detail="Not authenticated.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2072,95 +2185,4 @@ async def execute_verification(request: Request):
             "reason": "ip_cooldown"
         })
 
-    fingerprint = data.get("fingerprint", "").strip()
-
-    # ── Missing fingerprint: soft block ────────────────────────────────────
-    if not fingerprint or fingerprint in ("undefined", "null", ""):
-        logger.warning(f"[NO-FP] uid={uid} ip={client_ip} — soft block")
-        await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
-        return JSONResponse({"status": "blocked", "reason": "no_fingerprint"})
-
-    logger.info(
-        f"verify: uid={uid} ip={client_ip} "
-        f"tg_platform={tg_platform} tg_version={tg_version} "
-        f"canvas={canvas_hash[:8]}… webgl={webgl_hash[:8]}…"
-    )
-
-    if await DataEngine.is_ip_banned(client_ip):
-        await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
-        await DataEngine.ban_user(uid, 1)
-        return JSONResponse({"status": "blocked", "reason": "banned_ip"})
-
-    should_ban, ban_reason = await evaluate_clone_risk(
-        new_user_id=uid,
-        referrer_id=ref_id,
-        client_ip=client_ip,
-        fingerprint=fingerprint,
-        tg_platform=tg_platform,
-        tg_version=tg_version,
-        tg_app_version=tg_app_version,
-        canvas_hash=canvas_hash,
-        webgl_hash=webgl_hash,
-        screen_sig=screen_sig,
-    )
-    if should_ban:
-        await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
-        await DataEngine.ban_user(uid, 1)
-        await DataEngine.ban_ip(client_ip, f"clone_detect:{ban_reason}")
-        if msg_id > 0:
-            try: await bot.delete_message(chat_id=uid, message_id=msg_id)
-            except Exception: pass
-        logger.warning(f"[FRAUD-BAN] uid={uid} reason={ban_reason} ip={client_ip}")
-        return JSONResponse({"status": "blocked", "reason": ban_reason})
-
-    # ── VPN check — soft block, no ban ────────────────────────────────────
-    is_vpn = await execute_network_vpn_lookup(client_ip)
-    if is_vpn:
-        logger.info(f"[VPN-BLOCK] uid={uid} ip={client_ip} — soft block")
-        await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
-        return JSONResponse({"status": "blocked", "reason": "vpn"})
-
-    if msg_id > 0:
-        try: await bot.delete_message(chat_id=uid, message_id=msg_id)
-        except Exception: pass
-
-    referrer_ip = ""
-    if ref_id and ref_id != uid:
-        ref_verif = await DataEngine.get_verification(ref_id)
-        if ref_verif and ref_verif["ip_address"] not in ("", "BYPASS_ADMIN"):
-            referrer_ip = ref_verif["ip_address"]
-
-    await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""), ref_id or None)
-    await DataEngine.save_verification(
-        uid, client_ip, data.get("ua", ""), fingerprint,
-        referrer_ip=referrer_ip,
-        tg_platform=tg_platform,
-        tg_version=tg_version,
-        tg_app_version=tg_app_version,
-        canvas_hash=canvas_hash,
-        webgl_hash=webgl_hash,
-        screen_sig=screen_sig,
-    )
-
-    # ── ይህ IP አሁን verify ስላደረገ፣ ቀጣዩ NEW account ከዚሁ IP
-    #    ለ 3 ደቂቃ መጠበቅ አለበት (rapid multi-account creation እንዳይከሰት) ──
-    await ip_cooldown.mark_verified(client_ip)
-
-    if ref_id and ref_id != uid:
-        bounty = float(await DataEngine.get_setting("reward_per_referral", "10"))
-        await DataEngine.add_balance(ref_id, bounty)
-        try:
-            await bot.send_message(ref_id, f"🎉 <b>Referral verified!</b> <code>+{bounty:.2f} Birr</code> credited.")
-        except Exception:
-            pass
-
-    try:
-        await bot.send_message(uid, "✅ <b>Verification Confirmed! Access Granted.</b>", reply_markup=generate_dashboard_matrix(uid))
-    except Exception:
-        pass
-
-    return JSONResponse({"status": "verified"})
-
-
-if __name__ == "__main__":
-    uvicorn.run("bot:api_platform", host="0.0.0.0", port=8000, log_level="info")
+    fingerprint = 
