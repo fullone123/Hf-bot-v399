@@ -850,8 +850,19 @@ async def inspect_compulsory_memberships(user_id: int) -> list:
             m = await bot.get_chat_member(chat_id=ch["channel_id"], user_id=user_id)
             if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, ChatMemberStatus.RESTRICTED):
                 unjoined.append(dict(ch))
-        except Exception:
-            unjoined.append(dict(ch))
+        except Exception as e:
+            # IMPORTANT: if the bot itself isn't an admin in this channel
+            # (or the channel ID is wrong), get_chat_member() always throws
+            # — and treating that as "user hasn't joined" locks EVERY
+            # regular user out of the bot forever, on every button, while
+            # admins (who bypass this gate via BYPASS_ADMIN verification)
+            # never notice. So a misconfigured channel must NOT block
+            # users; it's logged instead so it's visible to the admin.
+            logger.warning(
+                f"[GATE] Could not check membership for channel={ch['channel_id']} "
+                f"user={user_id}: {e} — skipping this channel's check "
+                f"(bot may not be admin there)."
+            )
     return unjoined
 
 async def enforce_membership_gate(event, user_id: int) -> bool:
@@ -903,8 +914,12 @@ async def process_channel_revalidation(callback: CallbackQuery, state: FSMContex
                 m = await bot.get_chat_member(chat_id=ch["channel_id"], user_id=uid)
                 if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, ChatMemberStatus.RESTRICTED):
                     real_unjoined.append(ch)
-            except Exception:
-                real_unjoined.append(ch)
+            except Exception as e:
+                logger.warning(
+                    f"[GATE] Could not check membership for channel={ch['channel_id']} "
+                    f"user={uid}: {e} — skipping this channel's check "
+                    f"(bot may not be admin there)."
+                )
 
     if real_unjoined:
         return await callback.answer("❌ Please join all channels and continue.", show_alert=True)
