@@ -1,7 +1,8 @@
 """
 ================================================================================
                     TELEGRAM ADVANCED REFERRAL BOT SYSTEM
-         [ v3 Fix: Fingerprint-first clone detection, VPN operator bug fixed ]
+   [ v4: Softer fraud rules (fewer false-positive bans), stale verify-widget
+     cleanup on every /start, and a resumable "stop bot" admin control. ]
          [ One person = One account. Shared IP alone is NOT a ban reason.    ]
 ================================================================================
 """
@@ -132,13 +133,14 @@ PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
 CREATE TABLE IF NOT EXISTS users (
-    user_id     INTEGER PRIMARY KEY,
-    username    TEXT,
-    full_name   TEXT,
-    referred_by INTEGER,
-    balance     REAL    DEFAULT 0,
-    is_banned   INTEGER DEFAULT 0,
-    joined_at   TEXT    DEFAULT (datetime('now'))
+    user_id             INTEGER PRIMARY KEY,
+    username            TEXT,
+    full_name           TEXT,
+    referred_by         INTEGER,
+    balance             REAL    DEFAULT 0,
+    is_banned           INTEGER DEFAULT 0,
+    last_verify_msg_id  INTEGER DEFAULT 0,
+    joined_at           TEXT    DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS verifications (
@@ -210,6 +212,9 @@ INSERT OR IGNORE INTO fake_join_seen (user_id)
 SELECT user_id FROM verifications;
 """
 
+# NOTE: All ALTER TABLE statements are wrapped in try/except at apply-time
+# (see DataEngine.init_database) so they're safe to keep here permanently —
+# running them again on a DB that already has the columns is a harmless no-op.
 MIGRATION_STATEMENTS = [
     "ALTER TABLE verifications ADD COLUMN referrer_ip    TEXT DEFAULT ''",
     "ALTER TABLE verifications ADD COLUMN tg_platform    TEXT DEFAULT ''",
@@ -218,6 +223,7 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE verifications ADD COLUMN canvas_hash    TEXT DEFAULT ''",
     "ALTER TABLE verifications ADD COLUMN webgl_hash     TEXT DEFAULT ''",
     "ALTER TABLE verifications ADD COLUMN screen_sig     TEXT DEFAULT ''",
+    "ALTER TABLE users         ADD COLUMN last_verify_msg_id INTEGER DEFAULT 0",
     """CREATE TABLE IF NOT EXISTS fraud_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, reason TEXT, ip_address TEXT,
@@ -402,6 +408,14 @@ class DataEngine:
             return (await cur.fetchone())[0] or 0
 
     @staticmethod
+    async def set_last_verify_msg(user_id: int, msg_id: int):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET last_verify_msg_id = ? WHERE user_id = ?", (msg_id, user_id)
+            )
+            await db.commit()
+
+    @staticmethod
     async def create_withdrawal_atomic(
         user_id: int, amount: float, full_name: str, phone: str
     ) -> tuple[int, bool]:
@@ -507,25 +521,30 @@ class DataEngine:
             await db.commit()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FRAUD DETECTION ENGINE  (v3)
+# FRAUD DETECTION ENGINE  (v4)
 #
-# ዓላማ: አንድ ሰው = አንድ አካውንት
+# ዓላማ: አንድ ሰው = አንድ አካውንት — ግን ንፁ ተጠቃሚን ላለማጥፋት "strong signal ብቻ ban"
 #
 # RULES:
-#   • Self-referral                           → BAN (ግልጽ ማጭበርበር)
-#   • Same fingerprint (any user, any IP)     → BAN (አንድ ስልክ = አንድ ሰው)
-#   • Same fingerprint as referrer            → BAN (ራሱ ለራሱ invite)
-#   • Same IP as referrer only (no fp match)  → LOG (ጓደኛ/ቤተሰብ invite = ህጋዊ)
-#   • Canvas + WebGL + same IP                → BAN (ተመሳሳይ ስልክ፣ ተመሳሳይ network)
-#   • Canvas + WebGL only (diff IP)           → LOG (ተመሳሳይ model ስልክ = ህጋዊ)
-#   • TG device + IP + fingerprint all match  → BAN
-#   • Shared IP only                          → LOG (shared WiFi ህጋዊ ነው)
-#   • IP farm (>40 users)                     → BAN
+#   • Self-referral                                → BAN (ግልጽ ማጭበርበር)
+#   • Same fingerprint + same IP as another user    → BAN (በትክክል ተመሳሳይ መሣሪያ)
+#   • Same fingerprint only (diff IP)               → LOG (cache clear / family
+#                                                       phone ሊሆን ይችላል — ህጋዊ)
+#   • Same fingerprint as referrer                  → BAN (ራሱ ለራሱ invite)
+#   • Same IP as referrer only (no fp match)         → LOG (ጓደኛ/ቤተሰብ invite = ህጋዊ)
+#   • Canvas + WebGL + same IP                       → BAN (ተመሳሳይ ስልክ፣ ተመሳሳይ network)
+#   • Canvas + WebGL only (diff IP)                  → LOG (ተመሳሳይ model ስልክ = ህጋዊ)
+#   • TG device + IP + fingerprint all match          → BAN
+#   • Shared IP only                                 → LOG (shared WiFi ህጋዊ ነው)
+#   • IP farm (>40 users)                            → BAN
 #
-# KEY FIX vs v2:
-#   1. Fingerprint alone → BAN (ቀደም ሲል IP ያስፈልግ ነበር — WRONG)
-#   2. VPN operator bug → FIXED (ISP ስም ስለሚኖር ሁሉም ይታገድ ነበር — FIXED)
-#   3. MAX_USERS_PER_IP 5→10 (log), ban threshold 20→40 (farm only)
+# KEY FIX vs v3:
+#   1. Fingerprint match alone NO LONGER bans by itself — it now also
+#      requires the IP to match too. A fingerprint can legitimately repeat
+#      (same phone model, browser fingerprint reset after cache clear,
+#      a family sharing one device) without it being fraud. All such
+#      "weaker" matches are written to fraud_log for an admin to review
+#      manually instead of being auto-banned.
 # ─────────────────────────────────────────────────────────────────────────────
 
 MAX_USERS_PER_IP      = 10   # ከዚህ በላይ → ጠቅሰ ብቻ (shared WiFi ሊሆን ይችላል)
@@ -557,23 +576,37 @@ async def evaluate_clone_risk(
     fp_ok = fingerprint and fingerprint not in ("undefined", "null", "")
 
     # ── 2. Fingerprint match vs ANY existing verified user ────────────────
-    #    Fingerprint = device signature. Same fingerprint = same physical
-    #    device. One device → one account. IP doesn't matter here.
+    #    Fingerprint alone is no longer sufficient for a ban — it must also
+    #    share the IP with the existing account. Same fingerprint, different
+    #    IP, is logged for admin review only (could be a coincidence, a
+    #    family device, or a reinstalled browser).
     if fp_ok:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT user_id FROM verifications "
+                "SELECT user_id, ip_address FROM verifications "
                 "WHERE fingerprint = ? AND user_id != ? LIMIT 1",
                 (fingerprint, new_user_id),
             )
             existing = await cur.fetchone()
             if existing:
-                logger.warning(
-                    f"[FRAUD] Fingerprint match: new_uid={new_user_id} "
-                    f"matches uid={existing['user_id']} ip={client_ip}"
-                )
-                return True, "clone_of_existing"
+                existing_ip = existing["ip_address"] or ""
+                same_ip = ip_ok and existing_ip == client_ip
+                if same_ip:
+                    logger.warning(
+                        f"[FRAUD] Fingerprint+IP match: new_uid={new_user_id} "
+                        f"matches uid={existing['user_id']} ip={client_ip}"
+                    )
+                    return True, "clone_of_existing"
+                else:
+                    logger.warning(
+                        f"[FRAUD-WARN] Fingerprint match, different IP (not banning): "
+                        f"new_uid={new_user_id} matches uid={existing['user_id']}"
+                    )
+                    await DataEngine.log_fraud_attempt(
+                        new_user_id, "fingerprint_match_diff_ip", client_ip,
+                        f"matches_uid={existing['user_id']}"
+                    )
 
     # ── 3. Referrer device check ──────────────────────────────────────────
     #    FP matches referrer → same device used to invite itself → BAN.
@@ -806,11 +839,19 @@ async def process_channel_revalidation(callback: CallbackQuery, state: FSMContex
     if await DataEngine.is_verified(uid):
         await callback.message.answer("✅ Identity clear!", reply_markup=generate_dashboard_matrix(uid))
     else:
+        acc = await DataEngine.get_user(uid)
+        if acc and acc["last_verify_msg_id"]:
+            try:
+                await bot.delete_message(chat_id=uid, message_id=acc["last_verify_msg_id"])
+            except Exception:
+                pass
+
         sent = await callback.message.answer(
             f"{BOT_RULES_CAPTION}\n\n🔐 <b>Attestation Step:</b> Launch Mini App verification:",
             reply_markup=generate_verification_widget(uid, ref, 0)
         )
         await sent.edit_reply_markup(reply_markup=generate_verification_widget(uid, ref, sent.message_id))
+        await DataEngine.set_last_verify_msg(uid, sent.message_id)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CORE BOT HANDLERS
@@ -835,11 +876,24 @@ async def process_start_command(message: Message, state: FSMContext):
     if await DataEngine.is_verified(uid):
         return await message.answer("✅ <b>Welcome back!</b> Access granted.", reply_markup=generate_dashboard_matrix(uid))
 
+    # ── Clean up any stale, unfinished verification widget ────────────────
+    # If the user restarts the bot (or taps an old shared /start link)
+    # before completing verification, the previous "Open Mini App" message
+    # is deleted first and a brand-new one is sent in its place. This stops
+    # someone from passing around / re-using an old verification link and
+    # keeps the chat from filling up with duplicate widgets.
+    if acc and acc["last_verify_msg_id"]:
+        try:
+            await bot.delete_message(chat_id=uid, message_id=acc["last_verify_msg_id"])
+        except Exception:
+            pass
+
     sent = await message.answer(
         f"{BOT_RULES_CAPTION}\n\n🔐 <b>Next Step:</b> Verify identity via Mini App:",
         reply_markup=generate_verification_widget(uid, ref, 0)
     )
     await sent.edit_reply_markup(reply_markup=generate_verification_widget(uid, ref, sent.message_id))
+    await DataEngine.set_last_verify_msg(uid, sent.message_id)
 
 @core_router.callback_query(F.data == "ui_return_home")
 async def process_navigation_home(callback: CallbackQuery, state: FSMContext):
@@ -924,12 +978,11 @@ def parse_telegram_webapp_handshake(init_data: str) -> dict | None:
 
 async def execute_network_vpn_lookup(client_ip: str) -> bool:
     """
-    VPN CHECK — v3 FIX:
-    ቀደም ሲል 'operator' field ሲኖር True ይመልስ ነበር።
-    ችግሩ: 'operator' = ISP ስም ነው (Ethio Telecom, Safaricom ሁሉም አላቸው)
-    ስለዚህ ሁሉም legitimate Ethiopian users ይታገዱ ነበር።
-
-    አሁን: type = "VPN" ወይም "TOR" ብቻ ሲሆን True ይመልሳል።
+    VPN CHECK:
+    'operator' field (ISP name) is intentionally ignored — every legitimate
+    Ethiopian user is on an ISP like Ethio Telecom / Safaricom, so keying off
+    that field would ban normal users. Only an explicit VPN/TOR `type` from
+    the lookup service counts as a VPN hit.
     """
     if not client_ip or client_ip in ("127.0.0.1", "::1", "unknown"):
         return False
@@ -942,7 +995,6 @@ async def execute_network_vpn_lookup(client_ip: str) -> bool:
             d = payload.get(client_ip, {})
             ptype = (d.get("type") or "").upper()
             logger.info(f"proxycheck result ip={client_ip} type={ptype}")
-            # FIX: operator check ሙሉ በሙሉ ተወግዷል — VPN/TOR type ብቻ
             return ptype in ("VPN", "TOR")
     except Exception:
         logger.warning(f"proxycheck lookup failed for ip={client_ip}")
@@ -1441,6 +1493,19 @@ async def process_rm_channel_action(callback: CallbackQuery):
         await db.commit()
     await callback.message.edit_text("✅ Channel removed.", reply_markup=generate_admin_dashboard())
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN — STOP / RESUME BOT ENGINE
+#
+# Stopping the bot ONLY stops Telegram long-polling (no new /start, button
+# taps, or admin replies are processed). It does NOT touch the SQLite
+# database, the Mini App, or any stored balances/verifications/withdrawals —
+# all of that data is safe on disk the entire time. The "Resume Polling"
+# button below restarts the polling task in the same running process, so an
+# admin can pause and resume the bot without losing anything or having to
+# redeploy — as long as the underlying process/server itself stays alive.
+# ─────────────────────────────────────────────────────────────────────────────
+_polling_task: asyncio.Task | None = None
+
 @core_router.callback_query(F.data == "adm_stop_bot_confirm1")
 async def stop_bot_first_confirmation(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
@@ -1448,7 +1513,11 @@ async def stop_bot_first_confirmation(callback: CallbackQuery):
         [InlineKeyboardButton(text="⚠️ ኃላፊነቱን እወስዳለሁ - ቀጥል", callback_data="adm_stop_bot_confirm2")],
         [InlineKeyboardButton(text="❌ አቁም/ተመለስ",               callback_data="ui_admin_core")],
     ])
-    await callback.message.edit_text("🚨 <b>FIRST WARNING!</b>\n\nቦቱን ማቆም ከፈለጉ እርግጠኛ ነዎት?", reply_markup=markup)
+    await callback.message.edit_text(
+        "🚨 <b>FIRST WARNING!</b>\n\n"
+        "ቦቱን ማቆም ከፈለጉ እርግጠኛ ነዎት? (ይህ የ chat polling ብቻ ያቆማል — መረጃ/ሒሳብ አይጠፋም)",
+        reply_markup=markup
+    )
 
 @core_router.callback_query(F.data == "adm_stop_bot_confirm2")
 async def stop_bot_final_confirmation(callback: CallbackQuery):
@@ -1462,8 +1531,26 @@ async def stop_bot_final_confirmation(callback: CallbackQuery):
 @core_router.callback_query(F.data == "adm_stop_bot_execute")
 async def execute_bot_shutdown(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
-    await callback.message.edit_text("🛑 <b>Bot polling stopped. Mini App is still running.</b>")
+    await callback.message.edit_text(
+        "🛑 <b>Bot polling stopped.</b>\n\n"
+        "✅ All data, balances, and Mini App verification are safe and untouched.\n"
+        "▶️ Tap below to resume any time (process must still be running).",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="▶️ Resume Polling / ቀጥል", callback_data="adm_resume_bot_execute")
+        ]])
+    )
     await dp.stop_polling()
+
+@core_router.callback_query(F.data == "adm_resume_bot_execute")
+async def execute_bot_resume(callback: CallbackQuery):
+    global _polling_task
+    if not evaluate_admin_access(callback.from_user.id): return
+    if _polling_task is None or _polling_task.done():
+        _polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
+    await callback.message.edit_text(
+        "✅ <b>Bot polling resumed.</b> All data is intact.",
+        reply_markup=generate_admin_dashboard()
+    )
 
 @core_router.callback_query(F.data == "adm_cmd_edit_bal")
 async def process_edit_balance_start(callback: CallbackQuery, state: FSMContext):
@@ -1740,8 +1827,9 @@ async def process_full_unban_execute(message: Message, state: FSMContext):
 # ─────────────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def application_lifespan(app: FastAPI):
+    global _polling_task
     await DataEngine.init_database()
-    asyncio.create_task(dp.start_polling(bot, skip_updates=True))
+    _polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
     yield
 
 api_platform = FastAPI(lifespan=application_lifespan)
@@ -1812,9 +1900,6 @@ async def execute_verification(request: Request):
         await DataEngine.log_fraud_attempt(
             uid, "ip_cooldown_block", client_ip, f"remaining={seconds_left}s"
         )
-        # NOTE: retry_after_seconds ሆን ተብሎ client ላይ አይላክም —
-        # exact cooldown timing ቢታወቅ fraud automation script
-        # ትክክለኛ ሰዓት ጠብቆ መልሶ ሊሞክር ይችላል። Generic message ብቻ ይመለሳል።
         return JSONResponse({
             "status": "blocked",
             "reason": "ip_cooldown"
