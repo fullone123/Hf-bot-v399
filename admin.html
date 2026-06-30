@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bot Control Panel</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#090C0F;--panel:#111519;--panel2:#161B21;--line:#1E2530;
+  --text:#EAE5D9;--muted:#7A8090;--gold:#D4A24E;--gold2:#F0C06A;
+  --green:#4EC97A;--red:#E05048;--amber:#E0B25B;--blue:#4E9FD4;
+  --radius:14px;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased;min-height:100vh;}
+
+/* ── HEADER ── */
+header{position:sticky;top:0;z-index:20;
+  background:rgba(9,12,15,.88);backdrop-filter:blur(16px);
+  border-bottom:1px solid var(--line);
+  padding:0 28px;height:60px;
+  display:flex;align-items:center;justify-content:space-between;}
+.logo{font-family:'Space Grotesk',sans-serif;font-size:16px;font-weight:700;
+  display:flex;align-items:center;gap:10px;}
+.live-dot{position:relative;width:10px;height:10px;}
+.live-dot span{display:block;width:10px;height:10px;border-radius:50%;background:var(--green);}
+.live-dot::after{content:'';position:absolute;inset:-3px;border-radius:50%;
+  border:2px solid var(--green);opacity:0;animation:ping 2s ease-out infinite;}
+@keyframes ping{0%{opacity:.7;transform:scale(.8)}80%{opacity:0;transform:scale(1.8)}100%{opacity:0}}
+.header-right{display:flex;align-items:center;gap:16px;}
+.refresh-ring{width:22px;height:22px;position:relative;cursor:pointer;}
+.refresh-ring svg{width:22px;height:22px;transform:rotate(-90deg);}
+.refresh-ring circle.bg{stroke:var(--line);fill:none;stroke-width:2;}
+.refresh-ring circle.prog{stroke:var(--gold);fill:none;stroke-width:2;
+  stroke-dasharray:56.5;stroke-dashoffset:56.5;transition:stroke-dashoffset .4s linear;
+  stroke-linecap:round;}
+.header-right a{color:var(--muted);font-size:12.5px;text-decoration:none;
+  border:1px solid var(--line);padding:6px 14px;border-radius:8px;}
+.header-right a:hover{color:var(--text);border-color:var(--gold-dim);}
+
+/* ── MAIN ── */
+main{max-width:1200px;margin:0 auto;padding:28px 20px 80px;}
+
+/* ── STATS ── */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:32px;}
+.stat-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:20px;position:relative;overflow:hidden;}
+.stat-card::before{content:'';position:absolute;inset:0;background:linear-gradient(135deg,rgba(255,255,255,.02),transparent);pointer-events:none;}
+.stat-card .label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px;}
+.stat-card .val{font-family:'Space Grotesk',sans-serif;font-size:28px;font-weight:700;
+  background:linear-gradient(135deg,var(--gold),var(--gold2));-webkit-background-clip:text;
+  -webkit-text-fill-color:transparent;background-clip:text;line-height:1;}
+.stat-card.red .val{background:linear-gradient(135deg,var(--red),#F07070);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.stat-card.green .val{background:linear-gradient(135deg,var(--green),#7AE8A4);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.stat-card .delta{font-size:11px;color:var(--muted);margin-top:6px;}
+.stat-card .bar{position:absolute;bottom:0;left:0;height:2px;background:var(--gold);
+  opacity:.25;transition:width 1.2s cubic-bezier(.4,0,.2,1);}
+.stat-card.red .bar{background:var(--red);}
+.stat-card.green .bar{background:var(--green);}
+
+/* ── TABS ── */
+.tabs{display:flex;gap:2px;background:var(--panel);border:1px solid var(--line);
+  border-radius:10px;padding:4px;margin-bottom:20px;width:fit-content;}
+.tab-btn{background:none;border:none;color:var(--muted);font-size:13.5px;font-weight:500;
+  padding:9px 20px;cursor:pointer;border-radius:7px;font-family:inherit;transition:.2s;}
+.tab-btn.active{background:var(--panel2);color:var(--gold);box-shadow:0 1px 4px rgba(0,0,0,.3);}
+
+/* ── PANELS ── */
+.panel{display:none;animation:fadeIn .2s ease;}
+.panel.active{display:block;}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+/* ── TOOLBAR ── */
+.toolbar{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;align-items:center;}
+input[type=text],select{background:var(--panel);border:1px solid var(--line);color:var(--text);
+  padding:9px 12px;border-radius:9px;font-size:13.5px;font-family:inherit;outline:none;transition:.2s;}
+input[type=text]:focus,select:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(212,162,78,.1);}
+
+/* ── TABLE ── */
+.table-wrap{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;}
+table{width:100%;border-collapse:collapse;font-size:13px;}
+th{text-align:left;color:var(--muted);font-weight:500;font-size:11px;text-transform:uppercase;
+  letter-spacing:.05em;padding:12px 16px;border-bottom:1px solid var(--line);white-space:nowrap;}
+td{padding:12px 16px;border-bottom:1px solid rgba(30,37,48,.8);vertical-align:middle;transition:background .15s;}
+tr:last-child td{border-bottom:none;}
+tr:hover td{background:rgba(255,255,255,.018);}
+.tr-enter{animation:rowIn .25s ease forwards;}
+@keyframes rowIn{from{opacity:0;transform:translateX(-6px)}to{opacity:1;transform:none}}
+
+/* ── BADGE ── */
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:11.5px;font-weight:600;}
+.badge::before{content:'';width:5px;height:5px;border-radius:50%;}
+.badge.pending{background:rgba(224,178,91,.12);color:var(--amber);}
+.badge.pending::before{background:var(--amber);animation:blink 1.4s ease-in-out infinite;}
+.badge.approved{background:rgba(78,201,122,.12);color:var(--green);}
+.badge.approved::before{background:var(--green);}
+.badge.rejected{background:rgba(224,80,72,.12);color:var(--red);}
+.badge.rejected::before{background:var(--red);}
+.badge.banned{background:rgba(224,80,72,.12);color:var(--red);}
+.badge.banned::before{background:var(--red);}
+.badge.active{background:rgba(78,201,122,.12);color:var(--green);}
+.badge.active::before{background:var(--green);}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* ── BUTTONS ── */
+.btn{border:none;border-radius:8px;padding:7px 14px;font-size:12px;font-weight:600;
+  cursor:pointer;font-family:inherit;transition:.2s;}
+.btn:hover{filter:brightness(1.1);transform:translateY(-1px);}
+.btn:active{transform:translateY(0);}
+.btn:disabled{opacity:.35;cursor:default;transform:none;}
+.btn-approve{background:rgba(78,201,122,.15);color:var(--green);border:1px solid rgba(78,201,122,.25);}
+.btn-reject{background:rgba(224,80,72,.12);color:var(--red);border:1px solid rgba(224,80,72,.22);}
+.btn-ban{background:rgba(224,80,72,.1);color:var(--red);border:1px solid rgba(224,80,72,.2);}
+.btn-unban{background:rgba(78,201,122,.1);color:var(--green);border:1px solid rgba(78,201,122,.2);}
+.btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--line);}
+.btn-ghost:hover{color:var(--text);border-color:var(--gold-dim);}
+
+/* ── MISC ── */
+.empty{padding:48px;text-align:center;color:var(--muted);font-size:14px;}
+.empty span{display:block;font-size:32px;margin-bottom:10px;opacity:.4;}
+.mono{font-family:'JetBrains Mono',monospace;}
+.uid{color:var(--muted);}
+.pager{display:flex;gap:8px;align-items:center;margin-top:14px;justify-content:flex-end;}
+.pager-info{color:var(--muted);font-size:12px;margin-right:auto;}
+
+/* ── TOAST ── */
+.toast{position:fixed;bottom:24px;right:24px;
+  background:var(--panel);border:1px solid var(--line);
+  border-left:3px solid var(--gold);border-radius:10px;
+  padding:12px 18px;font-size:13.5px;
+  box-shadow:0 16px 40px rgba(0,0,0,.5);
+  opacity:0;transform:translateY(12px) scale(.96);
+  transition:.3s cubic-bezier(.34,1.56,.64,1);pointer-events:none;z-index:100;}
+.toast.show{opacity:1;transform:translateY(0) scale(1);}
+.toast.err{border-left-color:var(--red);}
+
+/* ── MODAL ── */
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.65);backdrop-filter:blur(4px);
+  display:none;align-items:center;justify-content:center;z-index:50;}
+.modal-bg.show{display:flex;}
+.modal{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:26px;width:360px;animation:fadeIn .2s ease;}
+.modal h3{font-size:15px;font-family:'Space Grotesk',sans-serif;margin-bottom:14px;}
+.modal textarea{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--text);
+  border-radius:9px;padding:10px;font-size:13px;font-family:inherit;min-height:70px;resize:vertical;outline:none;}
+.modal textarea:focus{border-color:var(--gold);}
+.modal-row{display:flex;gap:10px;margin-top:16px;justify-content:flex-end;}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="live-dot"><span></span></div>
+    Bot Control Panel
+  </div>
+  <div class="header-right">
+    <div class="refresh-ring" id="refreshRing" title="Auto-refresh" onclick="triggerRefresh()">
+      <svg viewBox="0 0 20 20">
+        <circle class="bg" cx="10" cy="10" r="9"/>
+        <circle class="prog" id="progCircle" cx="10" cy="10" r="9"/>
+      </svg>
+    </div>
+    <a href="/admin/logout">Sign out</a>
+  </div>
+</header>
+
+<main>
+  <div class="stats" id="stats">
+    <div class="stat-card"><div class="label">Registered Users</div><div class="val">—</div></div>
+    <div class="stat-card"><div class="label">Liabilities</div><div class="val">—</div></div>
+    <div class="stat-card"><div class="label">Pending</div><div class="val">—</div></div>
+    <div class="stat-card red"><div class="label">Banned Users</div><div class="val">—</div></div>
+    <div class="stat-card red"><div class="label">Banned IPs</div><div class="val">—</div></div>
+    <div class="stat-card"><div class="label">Fraud Entries</div><div class="val">—</div></div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="withdrawals">💸 Withdrawals</button>
+    <button class="tab-btn" data-tab="users">👥 Users</button>
+    <button class="tab-btn" data-tab="fraud">⚠️ Fraud Log</button>
+  </div>
+
+  <section class="panel active" id="panel-withdrawals">
+    <div class="toolbar">
+      <select id="wdStatus">
+        <option value="pending">Pending</option>
+        <option value="approved">Approved</option>
+        <option value="rejected">Rejected</option>
+        <option value="all">All</option>
+      </select>
+    </div>
+    <div class="table-wrap" id="wdTable"><div class="empty"><span>⏳</span>Loading…</div></div>
+  </section>
+
+  <section class="panel" id="panel-users">
+    <div class="toolbar">
+      <input type="text" id="userSearch" placeholder="Search by ID, username, or name…" style="min-width:280px">
+      <button class="btn btn-ghost" onclick="loadUsers(0)">Search</button>
+    </div>
+    <div class="table-wrap" id="usersTable"><div class="empty"><span>👥</span>Loading…</div></div>
+    <div class="pager">
+      <span class="pager-info" id="usersPageInfo"></span>
+      <button class="btn btn-ghost" id="usersPrev">‹ Prev</button>
+      <button class="btn btn-ghost" id="usersNext">Next ›</button>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-fraud">
+    <div class="table-wrap" id="fraudTable"><div class="empty"><span>⚠️</span>Loading…</div></div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<div class="modal-bg" id="rejectModal">
+  <div class="modal">
+    <h3>❌ Reject Withdrawal</h3>
+    <textarea id="rejectReason">Multi-account / Clone system detected.</textarea>
+    <div class="modal-row">
+      <button class="btn btn-ghost" onclick="closeRejectModal()">Cancel</button>
+      <button class="btn btn-reject" onclick="confirmReject()">Reject & Notify User</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── UTILS ──────────────────────────────────────────────────────────────
+function esc(s){if(s==null)return'';return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+let toastTimer;
+function showToast(msg,isErr=false){
+  const t=document.getElementById('toast');
+  t.textContent=msg;
+  t.className='toast show'+(isErr?' err':'');
+  clearTimeout(toastTimer);
+  toastTimer=setTimeout(()=>t.classList.remove('show'),2800);
+}
+
+async function api(path,opts={}){
+  const r=await fetch(path,{credentials:'same-origin',headers:{'Content-Type':'application/json'},...opts});
+  if(r.status===401){window.location.href='/admin/login';throw new Error('unauth');}
+  const j=await r.json();
+  if(!r.ok)throw new Error(j.detail||'Error');
+  return j;
+}
+
+// ── ANIMATED COUNTER ──────────────────────────────────────────────────
+function animateNumber(el, to, isFloat=false){
+  const from=parseFloat(el.dataset.raw)||0;
+  if(from===to){
+    el.textContent = isFloat?fmt(to):to.toLocaleString();
+    return;
+  }
+  let start;
+  const dur=800;
+  function step(ts){
+    if(!start)start=ts;
+    const p=Math.min((ts-start)/dur,1);
+    const ease=1-Math.pow(1-p,3);
+    const cur=from+(to-from)*ease;
+    el.textContent = isFloat?fmt(cur):Math.round(cur).toLocaleString();
+    if(p<1)requestAnimationFrame(step);
+    else el.dataset.raw=to;
+  }
+  el.dataset.raw=from;
+  requestAnimationFrame(step);
+}
+function fmt(n){return Number(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}
+
+// ── REFRESH RING ──────────────────────────────────────────────────────
+const REFRESH_INTERVAL=15000;
+let refreshAt=Date.now()+REFRESH_INTERVAL;
+function triggerRefresh(){refreshAt=0;}
+
+setInterval(()=>{
+  const circle=document.getElementById('progCircle');
+  if(!circle)return;
+  const remaining=Math.max(0,refreshAt-Date.now());
+  const pct=1-(remaining/REFRESH_INTERVAL);
+  const r=9;const circ=2*Math.PI*r;
+  circle.style.strokeDashoffset=circ-(circ*pct);
+  if(remaining<=0){
+    refreshAt=Date.now()+REFRESH_INTERVAL;
+    loadStats();
+    const active=document.querySelector('.tab-btn.active');
+    if(active?.dataset.tab==='withdrawals')loadWithdrawals();
+  }
+},300);
+
+// ── TABS ──────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab-btn').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('panel-'+btn.dataset.tab).classList.add('active');
+    if(btn.dataset.tab==='users')loadUsers(0);
+    if(btn.dataset.tab==='fraud')loadFraud();
+  });
+});
+
+// ── STATS ─────────────────────────────────────────────────────────────
+let prevStats={};
+async function loadStats(){
+  const s=await api('/admin/api/stats');
+  const defs=[
+    {label:'Registered Users',key:'registered_users',cls:''},
+    {label:'Outstanding Liabilities',key:'outstanding_liabilities',cls:'',float:true,suffix:' ETB'},
+    {label:'Pending Withdrawals',key:'pending_withdrawals',cls:'green'},
+    {label:'Banned Users',key:'banned_users',cls:'red'},
+    {label:'Banned IPs',key:'banned_ips',cls:'red'},
+    {label:'Fraud Entries',key:'fraud_log_entries',cls:''},
+  ];
+  document.getElementById('stats').innerHTML=defs.map((d,i)=>{
+    const v=s[d.key];
+    const barW=d.key==='registered_users'?Math.min(100,v):
+               d.key==='outstanding_liabilities'?Math.min(100,v/100):
+               Math.min(100,v*5);
+    return`<div class="stat-card ${d.cls}" id="sc${i}">
+      <div class="label">${d.label}</div>
+      <div class="val" id="sv${i}" data-raw="${prevStats[d.key]||0}">${d.float?fmt(v):v.toLocaleString()}${d.suffix||''}</div>
+      <div class="bar" style="width:${barW}%"></div>
+    </div>`;
+  }).join('');
+  defs.forEach((d,i)=>{
+    const el=document.getElementById('sv'+i);
+    if(el)animateNumber(el,s[d.key],d.float);
+  });
+  prevStats=s;
+}
+
+// ── WITHDRAWALS ───────────────────────────────────────────────────────
+async function loadWithdrawals(){
+  const status=document.getElementById('wdStatus').value;
+  const el=document.getElementById('wdTable');
+  el.innerHTML='<div class="empty"><span>⏳</span>Loading…</div>';
+  const data=await api(`/admin/api/withdrawals?status=${status}&limit=100`);
+  if(!data.withdrawals.length){
+    el.innerHTML='<div class="empty"><span>✅</span>Nothing here.</div>';
+    return;
+  }
+  el.innerHTML=`<table><thead><tr>
+    <th>ID</th><th>Holder</th><th>User ID</th><th>Amount</th><th>Phone</th><th>Status</th><th>Date</th><th style="min-width:180px"></th>
+  </tr></thead><tbody id="wdBody"></tbody></table>`;
+  const tbody=document.getElementById('wdBody');
+  data.withdrawals.forEach((w,i)=>{
+    const tr=document.createElement('tr');
+    tr.className='tr-enter';
+    tr.style.animationDelay=`${i*30}ms`;
+    tr.innerHTML=`
+      <td class="mono uid">#${w.id}</td>
+      <td>${esc(w.full_name)}</td>
+      <td class="mono uid">${w.user_id}</td>
+      <td class="mono" style="color:var(--gold)">${fmt(w.amount)} ETB</td>
+      <td class="mono uid">${esc(w.phone)}</td>
+      <td><span class="badge ${w.status}">${w.status}</span></td>
+      <td class="mono uid">${(w.created_at||'').slice(0,16)}</td>
+      <td>${w.status==='pending'?`
+        <button class="btn btn-approve" onclick="approveWD(${w.id})">✓ Approve</button>
+        <button class="btn btn-reject" onclick="openRejectModal(${w.id})">✕ Reject</button>
+      `:`<span class="uid" style="font-size:12px">${esc((w.reason||'').slice(0,30))}</span>`}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+document.getElementById('wdStatus').addEventListener('change',loadWithdrawals);
+
+async function approveWD(id){
+  if(!confirm(`Approve withdrawal #${id}?`))return;
+  try{
+    await api(`/admin/api/withdrawals/${id}/approve`,{method:'POST'});
+    showToast(`✅ Withdrawal #${id} approved — user notified.`);
+    loadWithdrawals();loadStats();
+  }catch(e){showToast('Failed: '+e.message,true);}
+}
+let pendingRejectId=null;
+function openRejectModal(id){pendingRejectId=id;document.getElementById('rejectModal').classList.add('show');}
+function closeRejectModal(){document.getElementById('rejectModal').classList.remove('show');pendingRejectId=null;}
+async function confirmReject(){
+  const reason=document.getElementById('rejectReason').value.trim();
+  try{
+    await api(`/admin/api/withdrawals/${pendingRejectId}/reject`,{method:'POST',body:JSON.stringify({reason})});
+    showToast(`❌ Withdrawal #${pendingRejectId} rejected — user notified.`);
+    closeRejectModal();loadWithdrawals();loadStats();
+  }catch(e){showToast('Failed: '+e.message,true);}
+}
+
+// ── USERS ─────────────────────────────────────────────────────────────
+const USERS_LIMIT=25;
+let usersOffset=0;
+async function loadUsers(offset){
+  usersOffset=offset;
+  const search=document.getElementById('userSearch').value.trim();
+  const el=document.getElementById('usersTable');
+  el.innerHTML='<div class="empty"><span>⏳</span>Loading…</div>';
+  const data=await api(`/admin/api/users?search=${encodeURIComponent(search)}&limit=${USERS_LIMIT}&offset=${offset}`);
+  if(!data.users.length){
+    el.innerHTML='<div class="empty"><span>🔍</span>No users found.</div>';
+  }else{
+    el.innerHTML=`<table><thead><tr>
+      <th>User ID</th><th>Name</th><th>Username</th><th>Balance</th><th>Status</th><th>Joined</th><th></th>
+    </tr></thead><tbody id="usersBody"></tbody></table>`;
+    const tbody=document.getElementById('usersBody');
+    data.users.forEach((u,i)=>{
+      const tr=document.createElement('tr');
+      tr.className='tr-enter';
+      tr.style.animationDelay=`${i*25}ms`;
+      tr.innerHTML=`
+        <td class="mono uid">${u.user_id}</td>
+        <td>${esc(u.full_name||'—')}</td>
+        <td class="mono uid">${u.username?'@'+esc(u.username):'—'}</td>
+        <td class="mono" style="color:var(--gold)">${fmt(u.balance)} ETB</td>
+        <td><span class="badge ${u.is_banned?'banned':'active'}">${u.is_banned?'Banned':'Active'}</span></td>
+        <td class="mono uid">${(u.joined_at||'').slice(0,10)}</td>
+        <td>${u.is_banned
+          ?`<button class="btn btn-unban" onclick="unbanUser(${u.user_id})">Unban</button>`
+          :`<button class="btn btn-ban" onclick="banUser(${u.user_id})">Ban</button>`
+        }</td>`;
+      tbody.appendChild(tr);
+    });
+  }
+  document.getElementById('usersPageInfo').textContent=`${offset+1}–${offset+data.users.length} of ${data.total}`;
+  document.getElementById('usersPrev').disabled=offset===0;
+  document.getElementById('usersNext').disabled=offset+USERS_LIMIT>=data.total;
+}
+document.getElementById('usersPrev').addEventListener('click',()=>loadUsers(Math.max(0,usersOffset-USERS_LIMIT)));
+document.getElementById('usersNext').addEventListener('click',()=>loadUsers(usersOffset+USERS_LIMIT));
+document.getElementById('userSearch').addEventListener('keydown',e=>{if(e.key==='Enter')loadUsers(0);});
+
+async function banUser(uid){
+  if(!confirm(`Ban user ${uid}?`))return;
+  try{await api(`/admin/api/users/${uid}/ban`,{method:'POST'});showToast(`🚫 User ${uid} banned.`);loadUsers(usersOffset);loadStats();}
+  catch(e){showToast('Failed: '+e.message,true);}
+}
+async function unbanUser(uid){
+  try{await api(`/admin/api/users/${uid}/unban`,{method:'POST',body:JSON.stringify({mode:'std'})});showToast(`✅ User ${uid} unbanned.`);loadUsers(usersOffset);loadStats();}
+  catch(e){showToast('Failed: '+e.message,true);}
+}
+
+// ── FRAUD LOG ─────────────────────────────────────────────────────────
+async function loadFraud(){
+  const el=document.getElementById('fraudTable');
+  el.innerHTML='<div class="empty"><span>⏳</span>Loading…</div>';
+  const data=await api('/admin/api/fraud_log?limit=50');
+  if(!data.entries.length){el.innerHTML='<div class="empty"><span>✅</span>No fraud entries.</div>';return;}
+  el.innerHTML=`<table><thead><tr>
+    <th>Reason</th><th>User ID</th><th>IP</th><th>Details</th><th>Time</th>
+  </tr></thead><tbody id="fraudBody"></tbody></table>`;
+  const tbody=document.getElementById('fraudBody');
+  data.entries.forEach((f,i)=>{
+    const tr=document.createElement('tr');
+    tr.className='tr-enter';
+    tr.style.animationDelay=`${i*20}ms`;
+    tr.innerHTML=`
+      <td class="mono" style="color:var(--amber)">${esc(f.reason)}</td>
+      <td class="mono uid">${f.user_id}</td>
+      <td class="mono uid">${esc(f.ip_address||'')}</td>
+      <td class="uid" style="font-size:12px;max-width:260px">${esc(f.details||'')}</td>
+      <td class="mono uid">${(f.logged_at||'').slice(0,16)}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+// ── INIT ──────────────────────────────────────────────────────────────
+loadStats();
+loadWithdrawals();
+</script>
+</body>
+</html>
