@@ -241,8 +241,7 @@ function showErr(reason, allowRetry){
    */
   const SELF_REASONS  = new Set(["self_invite", "same_device_as_referrer"]);
   const MULTI_REASONS = new Set([
-    "clone_of_existing", "clone_hardware", "clone_tg_device",
-    "ip_farm", "banned_ip"
+    "correlated_clone", "ip_farm", "banned_ip"
   ]);
 
   let category;
