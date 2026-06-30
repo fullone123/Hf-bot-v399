@@ -107,6 +107,14 @@ body::before{
 .pill.s-err{display:block;background:rgba(239,68,68,.07);color:#f87171;border:1px solid rgba(239,68,68,.18);}
 @keyframes pulse-ok{0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,.2)}50%{box-shadow:0 0 0 9px rgba(34,197,94,0)}}
 .icon-zone.state-ok .icon-bg{animation:pulse-ok 2s ease infinite;}
+.retry-btn{
+  display:none;width:100%;margin-top:14px;padding:12px;
+  border:none;border-radius:11px;cursor:pointer;
+  background:linear-gradient(90deg,#1d4ed8,#3b82f6);
+  color:#fff;font-size:.85rem;font-weight:700;
+  font-family:inherit;
+}
+.retry-btn.show{display:block;}
 </style>
 </head>
 <body>
@@ -156,6 +164,7 @@ body::before{
     </div>
   </div>
   <div class="pill" id="pill"></div>
+  <button class="retry-btn" id="retryBtn" onclick="location.reload()">🔄 እንደገና ይሞክሩ / Retry</button>
 </div>
 
 <script>
@@ -178,6 +187,7 @@ const TG_APP_VERSION = [TG_PLATFORM, TG_VERSION].filter(Boolean).join("_") || "u
 const $bar      = document.getElementById("bar");
 const $pill     = document.getElementById("pill");
 const $iconZone = document.getElementById("iconZone");
+const $retryBtn = document.getElementById("retryBtn");
 
 /* ── Helpers ──────────────────────────────────── */
 function setBar(p){ $bar.style.width = p + "%"; }
@@ -210,7 +220,7 @@ function showOK(){
   $pill.textContent = "✅ Verification complete. Closing…";
   tg?.HapticFeedback?.notificationOccurred("success");
 }
-function showErr(reason){
+function showErr(reason, allowRetry){
   $iconZone.classList.remove("state-ok");
   $iconZone.classList.add("state-err");
   document.getElementById("iShield").style.display = "none";
@@ -221,45 +231,55 @@ function showErr(reason){
   $pill.className = "pill s-err";
 
   /*
-   * SECURITY: detailed detection signal (fingerprint/canvas/IP timing)
-   * አይገለጽም። ግን ግልጽ "BANNED — permanent" message ይታያል፣ ምክንያቱም
-   * ግልጽ ያልሆነ "try again" message ሌባ ተስፋ ሰጥቶ ደጋግሞ እንዲሞክር ያደርገዋል።
-   * ግልጽ ban message ግን ተስፋ ያስቆርጣል እና ይተወዋል።
+   * NOTE: messaging softened on purpose.
+   * Hard, irreversible "BANNED — retrying is pointless" language was
+   * discouraging legitimate users from trying again after fixing a real
+   * issue (VPN still on, weak signal, temporary duplicate-device flag).
+   * Server-side fraud rules now only hard-ban on strong combined signals
+   * (fingerprint + IP both matching, etc). Anything softer surfaces a
+   * normal "couldn't verify, try again / contact admin" message instead.
    */
   const SELF_REASONS  = new Set(["self_invite", "same_device_as_referrer"]);
   const MULTI_REASONS = new Set([
     "clone_of_existing", "clone_hardware", "clone_tg_device",
-    "ip_farm", "banned_ip", "ip_cooldown"
+    "ip_farm", "banned_ip"
   ]);
 
   let category;
   if (reason === "vpn") {
     category = "vpn";
+  } else if (reason === "ip_cooldown") {
+    category = "cooldown";
+  } else if (reason === "no_fingerprint") {
+    category = "device_retry";
   } else if (SELF_REASONS.has(reason)) {
     category = "self";
   } else if (MULTI_REASONS.has(reason)) {
     category = "multi";
   } else {
-    // no_fingerprint / unknown — device couldn't be checked at all
-    category = "device";
+    category = "device_retry";
   }
 
   const msgs = {
     vpn: {
       t:"VPN Detected", s:"Please disable VPN and try again.",
-      b:"🔒 <strong>እባክዎ VPN ያጥፉ!</strong><br>VPN ግንኙነት ስለተገኘ ማለፍ አልተቻለም።<br>VPN <strong>Disconnect</strong> አድርገው በድጋሚ ይሞክሩ።"
+      b:"🔒 <strong>እባክዎ VPN ያጥፉ!</strong><br>VPN ግንኙነት ስለተገኘ ማለፍ አልተቻለም።<br>VPN <strong>Disconnect</strong> አድርገው እንደገና ይሞክሩ።"
+    },
+    cooldown: {
+      t:"Please Wait", s:"Too many attempts from this network.",
+      b:"⏳ <strong>እባክዎ ትንሽ ይጠብቁ!</strong><br>ከዚህ network ብዙ ሙከራዎች ስለተደረጉ ለጥቂት ደቂቃዎች ይጠብቁና እንደገና ይሞክሩ።"
+    },
+    device_retry: {
+      t:"Couldn't Verify", s:"We couldn't check your device — please retry.",
+      b:"⚠️ <strong>ማረጋገጥ አልተቻለም።</strong><br>እባክዎ app ዝግተው/ከፍተው እንደገና ይሞክሩ። ችግሩ ከቀጠለ admin ያነጋግሩ።"
     },
     self: {
-      t:"Banned", s:"Self-invite is not allowed.",
-      b:"🚫 <strong>አካውንትዎ ታግዷል!</strong><br>ለማጭበርበር ስለሞከሩ (ራስን መጋበዝ) አካውንትዎ በቋሚነት ታግዷል።<br>እንደገና መሞከር ምንም አይጠቅምም።"
+      t:"Verification Failed", s:"Self-invite is not allowed.",
+      b:"⚠️ <strong>ራስን መጋበዝ አይፈቀድም።</strong><br>ይሄ ሊንክ ስራ ላይ የሚውለው ሌላ ሰው ሲጠቀምበት ብቻ ነው። ስህተት ይመስልዎታል ካለ admin ያነጋግሩ።"
     },
     multi: {
-      t:"Banned", s:"Multiple accounts are not allowed.",
-      b:"🚫 <strong>አካውንትዎ ታግዷል!</strong><br>ለማጭበርበር ስለሞከሩ (ብዙ አካውንት) አካውንትዎ በቋሚነት ታግዷል።<br>እንደገና መሞከር ምንም አይጠቅምም።"
-    },
-    device: {
-      t:"Banned", s:"Verification not allowed on this device.",
-      b:"🚫 <strong>አካውንትዎ ታግዷል!</strong><br>ለማጭበርበር ስለሞከሩ አካውንትዎ ታግዷል።<br>እንደገና መሞከር ምንም አይጠቅምም።"
+      t:"Verification Failed", s:"This device/account looks like a duplicate.",
+      b:"⚠️ <strong>ይሄ መሣሪያ/አካውንት ቀደም ሲል ጥቅም ላይ ውሏል።</strong><br>ስህተት ይመስልዎታል ብለው ካመኑ admin ያነጋግሩ — በማረጋገጥ ይታያል።"
     },
   };
   const m = msgs[category];
@@ -267,6 +287,10 @@ function showErr(reason){
   document.getElementById("sub").textContent = m.s;
   $pill.innerHTML = m.b;
   tg?.HapticFeedback?.notificationOccurred("error");
+
+  if (allowRetry) {
+    $retryBtn.classList.add("show");
+  }
 }
 function closeApp(ms){ setTimeout(() => tg?.close(), ms); }
 
@@ -427,24 +451,28 @@ async function submit(fpData){
       closeApp(2000);
     } else if (result.status === "blocked") {
       err(3, "Rejected ✕");
-      showErr(result.reason || "unknown");
       /*
-       * Soft blocks (user can fix and retry): vpn, no_fingerprint, ip_cooldown
-       * Hard bans (permanent, close fast): everything else
+       * Soft blocks: user can fix something (VPN, wait out cooldown,
+       * retry fingerprinting) and try again right away.
+       * Hard blocks: server already evaluated strong combined fraud
+       * signals — still don't slam the door instantly, give the user
+       * the message + a manual retry button instead of a scary
+       * "don't bother" wall, but auto-close a bit sooner.
        */
-      const softBlock = ["vpn", "no_fingerprint"].includes(result.reason);
+      const softBlock = ["vpn", "no_fingerprint", "ip_cooldown"].includes(result.reason);
+      showErr(result.reason || "unknown", true);
       if (!softBlock) {
-        closeApp(6000);
+        closeApp(8000);
       }
-      // Soft blocks: don't auto-close — let user read and retry later
+      // Soft blocks: never auto-close — let the user read, fix, and retry.
     } else {
       throw new Error("Unexpected: " + JSON.stringify(result));
     }
   } catch(e) {
     err(3, "Failed ✕");
-    showErr("unknown");
+    showErr("unknown", true);
     console.error("[verify]", e);
-    closeApp(6000);
+    // Don't auto-close on unexpected client errors — let user retry manually.
   }
 })();
 </script>
