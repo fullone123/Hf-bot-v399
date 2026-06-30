@@ -980,18 +980,26 @@ async def process_start_command(message: Message, state: FSMContext):
 @core_router.callback_query(F.data == "ui_return_home")
 async def process_navigation_home(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    if not await enforce_membership_gate(callback, callback.from_user.id):
-        return
+    uid = callback.from_user.id
+    if not await DataEngine.is_verified(uid):
+        if not await enforce_membership_gate(callback, uid):
+            return
     await callback.message.edit_text(
         "🏠 <b>Main Dashboard Menu / ዋና ማውጫ</b>",
-        reply_markup=generate_dashboard_matrix(callback.from_user.id)
+        reply_markup=generate_dashboard_matrix(uid)
     )
 
 @core_router.callback_query(F.data == "ui_fetch_balance")
 async def process_balance_query(callback: CallbackQuery):
-    if not await enforce_membership_gate(callback, callback.from_user.id):
-        return
-    acc   = await DataEngine.get_user(callback.from_user.id)
+    uid = callback.from_user.id
+    # Already-verified users joined the required channels at verification
+    # time. Re-checking membership (one Telegram API call per channel) on
+    # every single button tap is what makes the bot look "stuck" once many
+    # users are tapping buttons concurrently — this skips that re-check.
+    if not await DataEngine.is_verified(uid):
+        if not await enforce_membership_gate(callback, uid):
+            return
+    acc   = await DataEngine.get_user(uid)
     min_w = await DataEngine.get_setting("min_withdrawal", "50")
     await callback.message.edit_text(
         f"💰 <b>Your Available Balance:</b>\n\n"
@@ -1002,9 +1010,10 @@ async def process_balance_query(callback: CallbackQuery):
 
 @core_router.callback_query(F.data == "ui_fetch_referrals")
 async def process_referral_query(callback: CallbackQuery):
-    if not await enforce_membership_gate(callback, callback.from_user.id):
-        return
-    uid          = callback.from_user.id
+    uid = callback.from_user.id
+    if not await DataEngine.is_verified(uid):
+        if not await enforce_membership_gate(callback, uid):
+            return
     direct, _    = await DataEngine.get_referral_metrics(uid)
     rate         = float(await DataEngine.get_setting("reward_per_referral", "10"))
     me           = await bot.get_me()
@@ -1020,8 +1029,10 @@ async def process_referral_query(callback: CallbackQuery):
 
 @core_router.callback_query(F.data == "ui_fetch_link")
 async def process_link_generation(callback: CallbackQuery):
-    if not await enforce_membership_gate(callback, callback.from_user.id):
-        return
+    uid = callback.from_user.id
+    if not await DataEngine.is_verified(uid):
+        if not await enforce_membership_gate(callback, uid):
+            return
     me = await bot.get_me()
     await callback.message.edit_text(
         f"🔗 <b>Your Invite Link:</b>\n\n"
@@ -1143,9 +1154,11 @@ def generate_fallback_navigation(target="ui_return_home") -> InlineKeyboardMarku
 # ─────────────────────────────────────────────────────────────────────────────
 @core_router.callback_query(F.data == "ui_initiate_withdrawal")
 async def process_withdrawal_start(callback: CallbackQuery, state: FSMContext):
-    if not await enforce_membership_gate(callback, callback.from_user.id):
-        return
-    user  = await DataEngine.get_user(callback.from_user.id)
+    uid = callback.from_user.id
+    if not await DataEngine.is_verified(uid):
+        if not await enforce_membership_gate(callback, uid):
+            return
+    user  = await DataEngine.get_user(uid)
     min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
     current_bal = round(float(user["balance"]), 2)
     if current_bal < min_w:
