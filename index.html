@@ -172,12 +172,6 @@ const initData = tg?.initData || "";
 
 const TG_PLATFORM = (tg?.platform || "").toLowerCase().trim();
 const TG_VERSION  = (tg?.version  || "").trim();
-
-/*
- * FIX: TG_APP_VERSION was wrongly set to language_code before.
- * Now correctly carries platform+version as a stable device identifier.
- * This is stable across sessions and meaningful for clone detection.
- */
 const TG_APP_VERSION = [TG_PLATFORM, TG_VERSION].filter(Boolean).join("_") || "unknown";
 
 /* ── DOM ──────────────────────────────────────── */
@@ -225,48 +219,50 @@ function showErr(reason){
   $bar.classList.remove("s-ok");
   $bar.classList.add("s-err");
   $pill.className = "pill s-err";
+
+  /*
+   * SECURITY: detailed detection signal (fingerprint/canvas/IP timing)
+   * አይገለጽም። ግን ግልጽ "BANNED — permanent" message ይታያል፣ ምክንያቱም
+   * ግልጽ ያልሆነ "try again" message ሌባ ተስፋ ሰጥቶ ደጋግሞ እንዲሞክር ያደርገዋል።
+   * ግልጽ ban message ግን ተስፋ ያስቆርጣል እና ይተወዋል።
+   */
+  const SELF_REASONS  = new Set(["self_invite", "same_device_as_referrer"]);
+  const MULTI_REASONS = new Set([
+    "clone_of_existing", "clone_hardware", "clone_tg_device",
+    "ip_farm", "banned_ip", "ip_cooldown"
+  ]);
+
+  let category;
+  if (reason === "vpn") {
+    category = "vpn";
+  } else if (SELF_REASONS.has(reason)) {
+    category = "self";
+  } else if (MULTI_REASONS.has(reason)) {
+    category = "multi";
+  } else {
+    // no_fingerprint / unknown — device couldn't be checked at all
+    category = "device";
+  }
+
   const msgs = {
     vpn: {
       t:"VPN Detected", s:"Please disable VPN and try again.",
       b:"🔒 <strong>እባክዎ VPN ያጥፉ!</strong><br>VPN ግንኙነት ስለተገኘ ማለፍ አልተቻለም።<br>VPN <strong>Disconnect</strong> አድርገው በድጋሚ ይሞክሩ።"
     },
-    no_fingerprint: {
-      t:"Check Failed", s:"Device verification could not complete.",
-      b:"📱 <strong>ማረጋገጫ አልተቻለም።</strong><br>ስልኩ fingerprint ማፍጠር አልቻለም።<br>ሌላ browser ወይም ስልክ ይሞክሩ።"
+    self: {
+      t:"Banned", s:"Self-invite is not allowed.",
+      b:"🚫 <strong>አካውንትዎ ታግዷል!</strong><br>ለማጭበርበር ስለሞከሩ (ራስን መጋበዝ) አካውንትዎ በቋሚነት ታግዷል።<br>እንደገና መሞከር ምንም አይጠቅምም።"
     },
-    self_invite:{
-      t:"Banned", s:"Self-referral detected.",
-      b:"🚫 <strong>አካውንትዎ ታግዷል!</strong><br>የራስዎን ሊንክ ተጠቅመዋል። ራስን መጋበዝ ክልክል ነው።"
+    multi: {
+      t:"Banned", s:"Multiple accounts are not allowed.",
+      b:"🚫 <strong>አካውንትዎ ታግዷል!</strong><br>ለማጭበርበር ስለሞከሩ (ብዙ አካውንት) አካውንትዎ በቋሚነት ታግዷል።<br>እንደገና መሞከር ምንም አይጠቅምም።"
     },
-    same_device_as_referrer:{
-      t:"Banned", s:"Same device as referrer.",
-      b:"📱 <strong>አካውንትዎ ታግዷል!</strong><br>ሊንኩን የሰጠዎት ሰው ከዚሁ ስልክ ነው።"
-    },
-    clone_of_existing:{
-      t:"Banned", s:"Device already registered.",
-      b:"📱 <strong>አካውንትዎ ታግዷል!</strong><br>ይህ ስልክ ቀደም ብሎ በሌላ አካውንት ተመዝግቧል።"
-    },
-    clone_hardware:{
-      t:"Banned", s:"Hardware signature conflict.",
-      b:"🖥 <strong>አካውንትዎ ታግዷል!</strong><br>ይህ ስልክ hardware ከሌላ አካውንት ጋር ተዛምዷል።"
-    },
-    clone_tg_device:{
-      t:"Banned", s:"Telegram device already in use.",
-      b:"📲 <strong>አካውንትዎ ታግዷል!</strong><br>ይህ Telegram app ቀደም ሲል ሌላ አካውንት ለ verify ጥቅም ላይ ውሏል።"
-    },
-    ip_farm:{
-      t:"Banned", s:"Suspicious network activity.",
-      b:"🌐 <strong>አካውንትዎ ታግዷል!</strong><br>ከዚህ network ልክ ያልሆነ activity ተገኝቷል።"
-    },
-    banned_ip:{
-      t:"Banned", s:"Network access denied.",
-      b:"🌐 <strong>አካውንትዎ ታግዷል!</strong><br>ከዚህ network ቀደም ብሎ ማጭበርበር ተገኝቷል።"
+    device: {
+      t:"Banned", s:"Verification not allowed on this device.",
+      b:"🚫 <strong>አካውንትዎ ታግዷል!</strong><br>ለማጭበርበር ስለሞከሩ አካውንትዎ ታግዷል።<br>እንደገና መሞከር ምንም አይጠቅምም።"
     },
   };
-  const m = msgs[reason] || {
-    t:"Blocked", s:"Security clearance rejected.",
-    b:"❌ <strong>ማለፍ አልተቻለም።</strong><br>የደህንነት ፍተሻውን ማጠናቀቅ አልተቻለም።"
-  };
+  const m = msgs[category];
   document.getElementById("ttl").textContent = m.t;
   document.getElementById("sub").textContent = m.s;
   $pill.innerHTML = m.b;
@@ -305,15 +301,11 @@ async function sha256(text){
   }
 }
 
-/* ── STEP 1 — Session validation ─────────────────
-   Replaces the useless ipify.org call.
-   Validates that Telegram initData is present and
-   the user object is readable — fast, no network.
-   ────────────────────────────────────────────── */
+/* ── STEP 1 — Session validation ─────────────────── */
 async function validateSession(){
   activate(1);
   setBar(10);
-  await new Promise(r => setTimeout(r, 300)); // small visual pause
+  await new Promise(r => setTimeout(r, 300));
 
   const user = tg?.initDataUnsafe?.user;
   if (!initData || !user?.id) {
@@ -323,22 +315,11 @@ async function validateSession(){
   setBar(30);
 }
 
-/* ── STEP 2 — Hardware fingerprints ──────────────
-   canvasHash  → canvas rendering signature
-   webglHash   → GPU/driver signature
-   screenSig   → screen geometry (plain string)
-   fingerprint → combined SHA-256 of stable signals
-
-   FIX: viewport dimensions REMOVED from fingerprint
-   because they change when keyboard opens/closes,
-   which caused the same user to get different
-   fingerprints across sessions.
-   ────────────────────────────────────────────── */
+/* ── STEP 2 — Hardware fingerprints ──────────────── */
 async function getFingerprint(){
   activate(2);
   setBar(40);
 
-  /* ── Canvas ── */
   let canvasRaw = "";
   try {
     const c   = document.createElement("canvas");
@@ -354,7 +335,6 @@ async function getFingerprint(){
   } catch {}
   const canvasHash = canvasRaw ? await sha256(canvasRaw) : "canvas_err";
 
-  /* ── WebGL ── */
   let webglRaw = "";
   try {
     const cv = document.createElement("canvas");
@@ -368,20 +348,11 @@ async function getFingerprint(){
   } catch {}
   const webglHash = webglRaw ? await sha256(webglRaw) : "webgl_err";
 
-  /* ── Screen signature — stable, not hashed ── */
   const screenSig = `${screen.width}x${screen.height}x${screen.colorDepth}@${Math.round(devicePixelRatio || 1) * 100}`;
 
-  /* ── System signals ── */
   const tz   = Intl.DateTimeFormat().resolvedOptions().timeZone || "unknown";
   const lang = navigator.language || "en";
 
-  /*
-   * FIX: Telegram viewport dimensions (viewportHeight, viewportStableHeight,
-   * isExpanded) are NOT included in the fingerprint anymore.
-   * They change whenever the keyboard opens/closes or the app is scrolled,
-   * making the same phone produce a different fingerprint each time.
-   * colorScheme IS stable so it stays in.
-   */
   let tgSig = "";
   if (tg) {
     const u = tg.initDataUnsafe?.user || {};
@@ -394,7 +365,6 @@ async function getFingerprint(){
     ].join("|");
   }
 
-  /* ── Combined fingerprint (stable signals only) ── */
   const combined = [
     canvasRaw.slice(-80),
     webglRaw,
@@ -430,12 +400,15 @@ async function submit(fpData){
     canvasHash:   fpData.canvasHash,
     webglHash:    fpData.webglHash,
     screenSig:    fpData.screenSig,
-    /* Telegram device info — corrected values */
     tgPlatform:   TG_PLATFORM,
     tgVersion:    TG_VERSION,
-    tgAppVersion: TG_APP_VERSION,   // FIX: was language_code, now platform_version
+    tgAppVersion: TG_APP_VERSION,
   });
 
+  if (r.status === 429) {
+    const j = await r.json().catch(() => ({}));
+    throw Object.assign(new Error("rate_limited"), { isRate: true, detail: j.detail });
+  }
   if (!r.ok) throw new Error(`Server ${r.status}`);
   return await r.json();
 }
@@ -456,15 +429,14 @@ async function submit(fpData){
       err(3, "Rejected ✕");
       showErr(result.reason || "unknown");
       /*
-       * VPN and no_fingerprint are soft blocks — user can fix and retry.
-       * Give more time to read the message, and don't close (let them fix it).
-       * Hard bans close after 6s.
+       * Soft blocks (user can fix and retry): vpn, no_fingerprint, ip_cooldown
+       * Hard bans (permanent, close fast): everything else
        */
-      const softBlock = result.reason === "vpn" || result.reason === "no_fingerprint";
+      const softBlock = ["vpn", "no_fingerprint"].includes(result.reason);
       if (!softBlock) {
         closeApp(6000);
       }
-      // For VPN/no_fingerprint: don't auto-close — user should fix the issue
+      // Soft blocks: don't auto-close — let user read and retry later
     } else {
       throw new Error("Unexpected: " + JSON.stringify(result));
     }
