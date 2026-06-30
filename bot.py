@@ -408,6 +408,25 @@ class DataEngine:
             return (await cur.fetchone())[0] or 0
 
     @staticmethod
+    async def count_ip_distinct_fingerprints(ip: str) -> int:
+        """
+        How many DIFFERENT device fingerprints have verified on this IP.
+        Used to tell a legitimate shared network (many distinct phones,
+        e.g. CGNAT / office WiFi / mobile carrier NAT) apart from a real
+        bot farm (few/duplicate fingerprints reused across many accounts).
+        """
+        if not ip or ip in ("127.0.0.1", "::1", "unknown", "BYPASS_ADMIN"):
+            return 0
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT COUNT(DISTINCT fingerprint) FROM verifications "
+                "WHERE ip_address = ? AND fingerprint != '' "
+                "AND fingerprint NOT LIKE 'BYPASS_%'",
+                (ip,)
+            )
+            return (await cur.fetchone())[0] or 0
+
+    @staticmethod
     async def set_last_verify_msg(user_id: int, msg_id: int):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
@@ -521,34 +540,67 @@ class DataEngine:
             await db.commit()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FRAUD DETECTION ENGINE  (v4)
+# FRAUD DETECTION ENGINE  (v5 — correlation-based)
 #
-# ዓላማ: አንድ ሰው = አንድ አካውንት — ግን ንፁ ተጠቃሚን ላለማጥፋት "strong signal ብቻ ban"
+# ዓላማ: አንድ ሰው = አንድ አካውንት — ግን ንፁ ተጠቃሚን ላለማጥፋት "ብቻውን ምንም signal ban
+# አያደርግም" የሚል መርህ ይከተላል። ይልቁንስ የ NEW ምዝገባ ምልክቶች ካለፈ ምዝገባ ጋር
+# **በስንት ገለልተኛ ምድቦች ላይ እንደሚገጣጠሙ** (correlation) እየቆጠረ ነው ውሳኔ
+# የሚሰጠው። እያንዳንዱ ምድብ ብቻውን በአጋጣሚ ሊገጣጠም ይችላል (ተመሳሳይ ስልክ ሞዴል፣
+# ተመሳሳይ WiFi፣ cache clear...) — ግን ብዙ ምድቦች ላይ በተመሳሳይ ጊዜ ከአንድ ሰው ጋር
+# ቢገጣጠሙ ብቻ እውነተኛ clone/multi-account ነው ብሎ በእርግጠኝነት መደምደም ይቻላል።
 #
-# RULES:
-#   • Self-referral                                → BAN (ግልጽ ማጭበርበር)
-#   • Same fingerprint + same IP as another user    → BAN (በትክክል ተመሳሳይ መሣሪያ)
-#   • Same fingerprint only (diff IP)               → LOG (cache clear / family
-#                                                       phone ሊሆን ይችላል — ህጋዊ)
-#   • Same fingerprint as referrer                  → BAN (ራሱ ለራሱ invite)
-#   • Same IP as referrer only (no fp match)         → LOG (ጓደኛ/ቤተሰብ invite = ህጋዊ)
-#   • Canvas + WebGL + same IP                       → BAN (ተመሳሳይ ስልክ፣ ተመሳሳይ network)
-#   • Canvas + WebGL only (diff IP)                  → LOG (ተመሳሳይ model ስልክ = ህጋዊ)
-#   • TG device + IP + fingerprint all match          → BAN
-#   • Shared IP only                                 → LOG (shared WiFi ህጋዊ ነው)
-#   • IP farm (>40 users)                            → BAN
+# MATCH CATEGORIES (እያንዳንዱ ነጥብ 1 ነው)፦
+#   • fingerprint ሙሉ ለሙሉ ይገጣጠማል
+#   • canvas_hash + webgl_hash ሁለቱም ይገጣጠማሉ (የ"ሃርድዌር" ምድብ)
+#   • ip_address ይገጣጠማል
+#   • tg_platform + tg_version ሁለቱም ይገጣጠማሉ
 #
-# KEY FIX vs v3:
-#   1. Fingerprint match alone NO LONGER bans by itself — it now also
-#      requires the IP to match too. A fingerprint can legitimately repeat
-#      (same phone model, browser fingerprint reset after cache clear,
-#      a family sharing one device) without it being fraud. All such
-#      "weaker" matches are written to fraud_log for an admin to review
-#      manually instead of being auto-banned.
+# DECISION (ከ ANY ነባር user ጋር ሲነጻጸር)፦
+#   • Self-referral (referrer_id == new_user_id)        → BAN (ሁልጊዜ ግልጽ ነው)
+#   • Score ≥ 3/4 ምድቦች ከአንድ ተመሳሳይ user ጋር ይገጣጠማሉ        → BAN
+#   • Score 1-2                                          → LOG ብቻ (admin review)
+#   • referrer ጋር ብቻ: fingerprint + (IP ወይም hardware)
+#     ሁለቱም ይገጣጠማሉ                                       → BAN ("ራሱ ራሱን ጋበዘ")
+#   • referrer ጋር fingerprint ብቻ ወይም IP ብቻ ይገጣጠማል         → LOG ብቻ
+#   • IP farm: ብዙ users በአንድ IP ላይ *እና* ጥቂት የተለያዩ
+#     fingerprints (ስለዚህ duplicate ስክሪፕት farm ይመስላል)      → BAN
+#     ብዙ users በአንድ IP ላይ ግን እያንዳንዱ የተለየ fingerprint
+#     አለው (ለምሳሌ CGNAT/mobile-data shared IP)               → LOG ብቻ፣ ban የለም
+#
+# ይሄ ከ v4 የበለጠ ጥንቃቄ ያለው ነው፦ ምንም single signal (fingerprint ብቻ፣ IP ብቻ፣
+# ስልክ ሞዴል ብቻ) ብቻውን ሰውን አያስታግድም።
 # ─────────────────────────────────────────────────────────────────────────────
 
-MAX_USERS_PER_IP      = 10   # ከዚህ በላይ → ጠቅሰ ብቻ (shared WiFi ሊሆን ይችላል)
-MAX_USERS_PER_IP_BAN  = 40   # ከዚህ በላይ → bot farm ነው → BAN
+CORRELATION_BAN_THRESHOLD = 3   # ከ 4ቱ ምድቦች ቢያንስ 3 ሲገጣጠሙ ብቻ BAN
+MAX_USERS_PER_IP          = 10  # ከዚህ በላይ → ጠቅሰ ብቻ (review)
+MAX_USERS_PER_IP_BAN      = 40  # ከዚህ በላይ *እና* ዝቅተኛ fingerprint diversity → BAN
+IP_FARM_MIN_FP_RATIO      = 0.5 # distinct_fp / user_count ከዚህ በታች ከሆነ "duplicate ስክሪፕት" ይመስላል
+
+
+def _category_match_score(
+    fingerprint: str, fp_ok: bool,
+    canvas_hash: str, webgl_hash: str, hw_ok: bool,
+    client_ip: str, ip_ok: bool,
+    tg_platform: str, tg_version: str, tg_ok: bool,
+    row: dict,
+) -> tuple[int, list]:
+    """Counts how many independent signal categories match a single candidate row."""
+    score = 0
+    matched = []
+    if fp_ok and row.get("fingerprint") and row["fingerprint"] == fingerprint:
+        score += 1
+        matched.append("fingerprint")
+    if hw_ok and row.get("canvas_hash") == canvas_hash and row.get("webgl_hash") == webgl_hash:
+        score += 1
+        matched.append("hardware")
+    if ip_ok and row.get("ip_address") and row["ip_address"] == client_ip:
+        score += 1
+        matched.append("ip")
+    if tg_ok and row.get("tg_platform") == tg_platform and row.get("tg_version") == tg_version:
+        score += 1
+        matched.append("tg_device")
+    return score, matched
+
 
 async def evaluate_clone_risk(
     new_user_id: int,
@@ -564,58 +616,85 @@ async def evaluate_clone_risk(
 ) -> tuple[bool, str]:
     """
     Returns (should_ban: bool, reason: str).
-    High confidence fraud only → ban.
-    Uncertain → log for admin review.
+    Bans only when multiple independent signals correlate to the SAME other
+    account. Any single matching signal alone is logged for admin review,
+    never auto-banned.
     """
 
     # ── 1. Self-referral ──────────────────────────────────────────────────
     if referrer_id and referrer_id == new_user_id:
         return True, "self_invite"
 
-    ip_ok = client_ip and client_ip not in ("127.0.0.1", "::1", "unknown")
-    fp_ok = fingerprint and fingerprint not in ("undefined", "null", "")
+    ip_ok = bool(client_ip) and client_ip not in ("127.0.0.1", "::1", "unknown")
+    fp_ok = bool(fingerprint) and fingerprint not in ("undefined", "null", "")
+    hw_ok = bool(canvas_hash) and len(canvas_hash) > 8 and bool(webgl_hash) and len(webgl_hash) > 8
+    tg_ok = bool(tg_platform) and bool(tg_version)
 
-    # ── 2. Fingerprint match vs ANY existing verified user ────────────────
-    #    Fingerprint alone is no longer sufficient for a ban — it must also
-    #    share the IP with the existing account. Same fingerprint, different
-    #    IP, is logged for admin review only (could be a coincidence, a
-    #    family device, or a reinstalled browser).
-    if fp_ok:
+    # ── 2. Correlate against every candidate that shares ≥1 signal ────────
+    if fp_ok or hw_ok or ip_ok or tg_ok:
+        conditions = []
+        params = []
+        if fp_ok:
+            conditions.append("fingerprint = ?")
+            params.append(fingerprint)
+        if hw_ok:
+            conditions.append("(canvas_hash = ? AND webgl_hash = ?)")
+            params.extend([canvas_hash, webgl_hash])
+        if ip_ok:
+            conditions.append("ip_address = ?")
+            params.append(client_ip)
+        if tg_ok:
+            conditions.append("(tg_platform = ? AND tg_version = ?)")
+            params.extend([tg_platform, tg_version])
+
+        query = (
+            "SELECT user_id, fingerprint, canvas_hash, webgl_hash, ip_address, "
+            "tg_platform, tg_version FROM verifications "
+            f"WHERE ({' OR '.join(conditions)}) AND user_id != ?"
+        )
+        params.append(new_user_id)
+
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                "SELECT user_id, ip_address FROM verifications "
-                "WHERE fingerprint = ? AND user_id != ? LIMIT 1",
-                (fingerprint, new_user_id),
+            cur = await db.execute(query, params)
+            candidates = await cur.fetchall()
+
+        best_score, best_uid, best_matched = 0, None, []
+        for row in candidates:
+            score, matched = _category_match_score(
+                fingerprint, fp_ok, canvas_hash, webgl_hash, hw_ok,
+                client_ip, ip_ok, tg_platform, tg_version, tg_ok, dict(row)
             )
-            existing = await cur.fetchone()
-            if existing:
-                existing_ip = existing["ip_address"] or ""
-                same_ip = ip_ok and existing_ip == client_ip
-                if same_ip:
-                    logger.warning(
-                        f"[FRAUD] Fingerprint+IP match: new_uid={new_user_id} "
-                        f"matches uid={existing['user_id']} ip={client_ip}"
-                    )
-                    return True, "clone_of_existing"
-                else:
-                    logger.warning(
-                        f"[FRAUD-WARN] Fingerprint match, different IP (not banning): "
-                        f"new_uid={new_user_id} matches uid={existing['user_id']}"
-                    )
-                    await DataEngine.log_fraud_attempt(
-                        new_user_id, "fingerprint_match_diff_ip", client_ip,
-                        f"matches_uid={existing['user_id']}"
-                    )
+            if score > best_score:
+                best_score, best_uid, best_matched = score, row["user_id"], matched
 
-    # ── 3. Referrer device check ──────────────────────────────────────────
-    #    FP matches referrer → same device used to invite itself → BAN.
-    #    Same IP only (no FP match) → friend invited friend → LOG only.
-    if referrer_id and fp_ok:
+        if best_score >= CORRELATION_BAN_THRESHOLD:
+            logger.warning(
+                f"[FRAUD] Correlated clone: new_uid={new_user_id} matches "
+                f"uid={best_uid} on {best_matched} (score={best_score})"
+            )
+            return True, "correlated_clone"
+        elif best_score >= 1:
+            logger.warning(
+                f"[FRAUD-WARN] Partial signal match (not banning): "
+                f"new_uid={new_user_id} matches uid={best_uid} on {best_matched} (score={best_score})"
+            )
+            await DataEngine.log_fraud_attempt(
+                new_user_id, "partial_signal_match", client_ip,
+                f"matches_uid={best_uid} categories={best_matched} score={best_score}"
+            )
+
+    # ── 3. Referrer device check ────────────────────────────────────────
+    #    Needs fingerprint match PLUS (IP or hardware) match against the
+    #    referrer specifically — a single matching signal with the referrer
+    #    alone (e.g. just sharing IP, just sharing fingerprint) is normal
+    #    for family/friends and is only logged.
+    if referrer_id and (fp_ok or ip_ok or hw_ok):
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT ip_address, fingerprint FROM verifications WHERE user_id = ?",
+                "SELECT ip_address, fingerprint, canvas_hash, webgl_hash "
+                "FROM verifications WHERE user_id = ?",
                 (referrer_id,)
             )
             inv_row = await cur.fetchone()
@@ -624,82 +703,50 @@ async def evaluate_clone_risk(
                 inv_fp = inv_row["fingerprint"] or ""
                 is_real_ip = inv_ip not in ("", "127.0.0.1", "::1", "unknown", "BYPASS_ADMIN")
 
-                if inv_fp and inv_fp == fingerprint:
-                    # ተመሳሳይ fingerprint ከ referrer → ራሱ invite አደረገ
-                    return True, "same_device_as_referrer"
+                fp_matches_ref = fp_ok and inv_fp and inv_fp == fingerprint
+                ip_matches_ref = ip_ok and is_real_ip and inv_ip == client_ip
+                hw_matches_ref = (
+                    hw_ok and inv_row["canvas_hash"] == canvas_hash
+                    and inv_row["webgl_hash"] == webgl_hash
+                )
 
-                if is_real_ip and inv_ip == client_ip:
-                    # ተመሳሳይ IP ብቻ → ጓደኛ/ቤተሰብ invite ሊሆን ይችላል → ጠቅሰ ብቻ
+                ref_score = sum([fp_matches_ref, ip_matches_ref, hw_matches_ref])
+
+                if fp_matches_ref and (ip_matches_ref or hw_matches_ref):
+                    return True, "same_device_as_referrer"
+                elif ref_score >= 1:
                     logger.warning(
-                        f"[FRAUD-WARN] Shared IP with referrer (not banning): "
-                        f"ref={referrer_id} new={new_user_id} ip={client_ip}"
+                        f"[FRAUD-WARN] Single-signal match with referrer (not banning): "
+                        f"ref={referrer_id} new={new_user_id} "
+                        f"fp={fp_matches_ref} ip={ip_matches_ref} hw={hw_matches_ref}"
                     )
                     await DataEngine.log_fraud_attempt(
-                        new_user_id, "shared_ip_with_referrer", client_ip,
-                        f"referrer={referrer_id}"
+                        new_user_id, "referrer_signal_match", client_ip,
+                        f"referrer={referrer_id} fp={fp_matches_ref} ip={ip_matches_ref} hw={hw_matches_ref}"
                     )
 
-    # ── 4. Canvas + WebGL hardware clone ──────────────────────────────────
-    #    canvas + webgl + same IP → ተመሳሳይ ስልክ on ተመሳሳይ network → BAN
-    #    canvas + webgl only (diff IP) → ተመሳሳይ model ስልክ → LOG only
-    if (canvas_hash and len(canvas_hash) > 8
-            and webgl_hash and len(webgl_hash) > 8):
-
-        if ip_ok:
-            async with aiosqlite.connect(DB_PATH) as db:
-                cur = await db.execute(
-                    "SELECT user_id FROM verifications "
-                    "WHERE canvas_hash = ? AND webgl_hash = ? AND ip_address = ? "
-                    "AND user_id != ? LIMIT 1",
-                    (canvas_hash, webgl_hash, client_ip, new_user_id),
-                )
-                if await cur.fetchone():
-                    return True, "clone_hardware"
-
-        # Canvas+WebGL match without IP → log only (same phone model)
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT user_id FROM verifications "
-                "WHERE canvas_hash = ? AND webgl_hash = ? AND user_id != ? LIMIT 1",
-                (canvas_hash, webgl_hash, new_user_id),
-            )
-            row = await cur.fetchone()
-            if row:
-                logger.warning(
-                    f"[FRAUD-WARN] Same canvas+webgl different IP (not banning): "
-                    f"uid={new_user_id} matches uid={row['user_id']}"
-                )
-                await DataEngine.log_fraud_attempt(
-                    new_user_id, "same_hardware_diff_ip", client_ip,
-                    f"matches_uid={row['user_id']}"
-                )
-
-    # ── 5. TG device clone — IP + fingerprint + platform all must match ───
-    if tg_platform and tg_version and fp_ok and ip_ok:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT user_id FROM verifications "
-                "WHERE tg_platform = ? AND tg_version = ? AND ip_address = ? "
-                "AND fingerprint = ? AND user_id != ? LIMIT 1",
-                (tg_platform, tg_version, client_ip, fingerprint, new_user_id),
-            )
-            existing = await cur.fetchone()
-            if existing:
-                return True, "clone_tg_device"
-
-    # ── 6. IP farm detection ──────────────────────────────────────────────
+    # ── 4. IP farm detection — aware of shared-NAT / CGNAT networks ───────
+    #    A high user count on one IP is, by itself, completely normal in
+    #    Ethiopia where mobile carriers use CGNAT (many real customers
+    #    share one public IP). We only treat it as a farm when the SAME IP
+    #    also shows low fingerprint diversity — i.e. the same handful of
+    #    device fingerprints being reused across many accounts, which is
+    #    what a scripted farm looks like. Distinct real phones on a shared
+    #    network are never banned for this alone.
     if ip_ok:
         ip_count = await DataEngine.count_ip_users(client_ip)
         if ip_count >= MAX_USERS_PER_IP:
+            distinct_fp = await DataEngine.count_ip_distinct_fingerprints(client_ip)
+            fp_ratio = (distinct_fp / ip_count) if ip_count else 1.0
             logger.warning(
-                f"[FRAUD-WARN] High IP usage: ip={client_ip} "
-                f"count={ip_count} new_uid={new_user_id}"
+                f"[FRAUD-WARN] High IP usage: ip={client_ip} count={ip_count} "
+                f"distinct_fp={distinct_fp} ratio={fp_ratio:.2f} new_uid={new_user_id}"
             )
             await DataEngine.log_fraud_attempt(
                 new_user_id, "high_ip_usage", client_ip,
-                f"existing_users_on_ip={ip_count}"
+                f"users={ip_count} distinct_fp={distinct_fp} ratio={fp_ratio:.2f}"
             )
-            if ip_count >= MAX_USERS_PER_IP_BAN:
+            if ip_count >= MAX_USERS_PER_IP_BAN and fp_ratio < IP_FARM_MIN_FP_RATIO:
                 return True, "ip_farm"
 
     return False, ""
