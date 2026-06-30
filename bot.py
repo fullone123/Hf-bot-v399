@@ -1,9 +1,8 @@
 """
 ================================================================================
                     TELEGRAM ADVANCED REFERRAL BOT SYSTEM
-         [ Upgraded Production Engine - High Traffic & Safe Logs ]
-         [ Security Patched: Double-spend, Rate-limit, IP check, Clone detect ]
-         [ v2 Fix: Reduced false-positive bans on shared networks/devices ]
+         [ v3 Fix: Fingerprint-first clone detection, VPN operator bug fixed ]
+         [ One person = One account. Shared IP alone is NOT a ban reason.    ]
 ================================================================================
 """
 
@@ -352,7 +351,6 @@ class DataEngine:
 
     @staticmethod
     async def log_fraud_attempt(user_id: int, reason: str, ip: str, details: str = ""):
-        """Log fraud suspicion without banning — for admin review."""
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "INSERT INTO fraud_log (user_id, reason, ip_address, details) VALUES (?,?,?,?)",
@@ -362,7 +360,6 @@ class DataEngine:
 
     @staticmethod
     async def count_ip_users(ip: str) -> int:
-        """Count how many verified users share the same IP."""
         if not ip or ip in ("127.0.0.1", "::1", "unknown", "BYPASS_ADMIN"):
             return 0
         async with aiosqlite.connect(DB_PATH) as db:
@@ -477,20 +474,29 @@ class DataEngine:
             await db.commit()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FRAUD DETECTION ENGINE  (v2 — reduced false positives)
+# FRAUD DETECTION ENGINE  (v3)
 #
-# PHILOSOPHY:
-#   • Self-referral          → ALWAYS ban  (intentional, clear fraud)
-#   • Same device + same IP  → ban         (very high confidence clone)
-#   • Same IP only           → LOG only    (could be family / office WiFi)
-#   • Canvas+WebGL+IP match  → ban         (hardware clone confirmed)
-#   • Canvas+WebGL only      → LOG only    (same phone model is common)
-#   • TG device clone        → must also share IP or fingerprint to ban
-#   • Missing fingerprint    → soft block, NOT ban (old phone / JS error)
+# ዓላማ: አንድ ሰው = አንድ አካውንት
+#
+# RULES:
+#   • Self-referral                           → BAN (ግልጽ ማጭበርበር)
+#   • Same fingerprint (any user, any IP)     → BAN (አንድ ስልክ = አንድ ሰው)
+#   • Same fingerprint as referrer            → BAN (ራሱ ለራሱ invite)
+#   • Same IP as referrer only (no fp match)  → LOG (ጓደኛ/ቤተሰብ invite = ህጋዊ)
+#   • Canvas + WebGL + same IP                → BAN (ተመሳሳይ ስልክ፣ ተመሳሳይ network)
+#   • Canvas + WebGL only (diff IP)           → LOG (ተመሳሳይ model ስልክ = ህጋዊ)
+#   • TG device + IP + fingerprint all match  → BAN
+#   • Shared IP only                          → LOG (shared WiFi ህጋዊ ነው)
+#   • IP farm (>40 users)                     → BAN
+#
+# KEY FIX vs v2:
+#   1. Fingerprint alone → BAN (ቀደም ሲል IP ያስፈልግ ነበር — WRONG)
+#   2. VPN operator bug → FIXED (ISP ስም ስለሚኖር ሁሉም ይታገድ ነበር — FIXED)
+#   3. MAX_USERS_PER_IP 5→10 (log), ban threshold 20→40 (farm only)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# How many users from the same IP is suspicious (shared WiFi threshold)
-MAX_USERS_PER_IP = 5
+MAX_USERS_PER_IP      = 10   # ከዚህ በላይ → ጠቅሰ ብቻ (shared WiFi ሊሆን ይችላል)
+MAX_USERS_PER_IP_BAN  = 40   # ከዚህ በላይ → bot farm ነው → BAN
 
 async def evaluate_clone_risk(
     new_user_id: int,
@@ -506,18 +512,40 @@ async def evaluate_clone_risk(
 ) -> tuple[bool, str]:
     """
     Returns (should_ban: bool, reason: str).
-    Only returns True when confidence of fraud is HIGH.
-    Suspicious-but-uncertain cases are logged without banning.
+    High confidence fraud only → ban.
+    Uncertain → log for admin review.
     """
 
-    # ── 1. Self-referral — always ban, crystal clear ──────────────────────
+    # ── 1. Self-referral ──────────────────────────────────────────────────
     if referrer_id and referrer_id == new_user_id:
         return True, "self_invite"
 
     ip_ok = client_ip and client_ip not in ("127.0.0.1", "::1", "unknown")
+    fp_ok = fingerprint and fingerprint not in ("undefined", "null", "")
 
-    # ── 2. Compare against referrer's verification record ─────────────────
-    if ip_ok and referrer_id:
+    # ── 2. Fingerprint match vs ANY existing verified user ────────────────
+    #    Fingerprint = device signature. Same fingerprint = same physical
+    #    device. One device → one account. IP doesn't matter here.
+    if fp_ok:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT user_id FROM verifications "
+                "WHERE fingerprint = ? AND user_id != ? LIMIT 1",
+                (fingerprint, new_user_id),
+            )
+            existing = await cur.fetchone()
+            if existing:
+                logger.warning(
+                    f"[FRAUD] Fingerprint match: new_uid={new_user_id} "
+                    f"matches uid={existing['user_id']} ip={client_ip}"
+                )
+                return True, "clone_of_existing"
+
+    # ── 3. Referrer device check ──────────────────────────────────────────
+    #    FP matches referrer → same device used to invite itself → BAN.
+    #    Same IP only (no FP match) → friend invited friend → LOG only.
+    if referrer_id and fp_ok:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
@@ -530,53 +558,39 @@ async def evaluate_clone_risk(
                 inv_fp = inv_row["fingerprint"] or ""
                 is_real_ip = inv_ip not in ("", "127.0.0.1", "::1", "unknown", "BYPASS_ADMIN")
 
+                if inv_fp and inv_fp == fingerprint:
+                    # ተመሳሳይ fingerprint ከ referrer → ራሱ invite አደረገ
+                    return True, "same_device_as_referrer"
+
                 if is_real_ip and inv_ip == client_ip:
-                    if fingerprint and inv_fp and inv_fp == fingerprint:
-                        # Same device + same IP as referrer → definite clone
-                        return True, "same_device_as_referrer"
-                    else:
-                        # Same IP only → could be family WiFi, just log it
-                        logger.warning(
-                            f"[FRAUD-WARN] Shared IP with referrer (not banning): "
-                            f"ref={referrer_id} new={new_user_id} ip={client_ip}"
-                        )
-                        await DataEngine.log_fraud_attempt(
-                            new_user_id, "shared_ip_with_referrer", client_ip,
-                            f"referrer={referrer_id}"
-                        )
-                        # Do NOT ban — shared WiFi is common
+                    # ተመሳሳይ IP ብቻ → ጓደኛ/ቤተሰብ invite ሊሆን ይችላል → ጠቅሰ ብቻ
+                    logger.warning(
+                        f"[FRAUD-WARN] Shared IP with referrer (not banning): "
+                        f"ref={referrer_id} new={new_user_id} ip={client_ip}"
+                    )
+                    await DataEngine.log_fraud_attempt(
+                        new_user_id, "shared_ip_with_referrer", client_ip,
+                        f"referrer={referrer_id}"
+                    )
 
-    # ── 3. Exact fingerprint match with any existing user ─────────────────
-    if ip_ok and fingerprint:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-
-            # Same fingerprint + same IP as any other user → ban
-            cur = await db.execute(
-                "SELECT user_id FROM verifications "
-                "WHERE ip_address = ? AND fingerprint = ? AND user_id != ? LIMIT 1",
-                (client_ip, fingerprint, new_user_id),
-            )
-            if await cur.fetchone():
-                return True, "clone_of_existing"
-
-    # ── 4. Canvas + WebGL hardware clone check ────────────────────────────
-    #    Require BOTH canvas AND webgl AND same IP to ban.
-    #    Canvas alone is not enough — same phone model gives same hash.
+    # ── 4. Canvas + WebGL hardware clone ──────────────────────────────────
+    #    canvas + webgl + same IP → ተመሳሳይ ስልክ on ተመሳሳይ network → BAN
+    #    canvas + webgl only (diff IP) → ተመሳሳይ model ስልክ → LOG only
     if (canvas_hash and len(canvas_hash) > 8
-            and webgl_hash and len(webgl_hash) > 8
-            and ip_ok):
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT user_id FROM verifications "
-                "WHERE canvas_hash = ? AND webgl_hash = ? AND ip_address = ? "
-                "AND user_id != ? LIMIT 1",
-                (canvas_hash, webgl_hash, client_ip, new_user_id),
-            )
-            if await cur.fetchone():
-                return True, "clone_hardware"
+            and webgl_hash and len(webgl_hash) > 8):
 
-        # Canvas + WebGL match without IP → only log, don't ban
+        if ip_ok:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cur = await db.execute(
+                    "SELECT user_id FROM verifications "
+                    "WHERE canvas_hash = ? AND webgl_hash = ? AND ip_address = ? "
+                    "AND user_id != ? LIMIT 1",
+                    (canvas_hash, webgl_hash, client_ip, new_user_id),
+                )
+                if await cur.fetchone():
+                    return True, "clone_hardware"
+
+        # Canvas+WebGL match without IP → log only (same phone model)
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
                 "SELECT user_id FROM verifications "
@@ -594,10 +608,8 @@ async def evaluate_clone_risk(
                     f"matches_uid={row['user_id']}"
                 )
 
-    # ── 5. TG device clone — must share IP or fingerprint to ban ──────────
-    #    tg_platform + tg_version alone is too common (many users on same
-    #    Telegram version), so we require a corroborating signal.
-    if tg_platform and tg_version and fingerprint and ip_ok:
+    # ── 5. TG device clone — IP + fingerprint + platform all must match ───
+    if tg_platform and tg_version and fp_ok and ip_ok:
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
                 "SELECT user_id FROM verifications "
@@ -607,15 +619,9 @@ async def evaluate_clone_risk(
             )
             existing = await cur.fetchone()
             if existing:
-                logger.warning(
-                    f"[FRAUD] TG device clone confirmed: uid={new_user_id} "
-                    f"matches uid={existing['user_id']} "
-                    f"platform={tg_platform} ver={tg_version} ip={client_ip}"
-                )
                 return True, "clone_tg_device"
 
-    # ── 6. Excessive users from one IP (bot farm detection) ───────────────
-    #    Do not ban — just log for admin review.
+    # ── 6. IP farm detection ──────────────────────────────────────────────
     if ip_ok:
         ip_count = await DataEngine.count_ip_users(client_ip)
         if ip_count >= MAX_USERS_PER_IP:
@@ -627,8 +633,7 @@ async def evaluate_clone_risk(
                 new_user_id, "high_ip_usage", client_ip,
                 f"existing_users_on_ip={ip_count}"
             )
-            # Only ban if absurdly high (likely a bot farm, not a school WiFi)
-            if ip_count >= MAX_USERS_PER_IP * 4:
+            if ip_count >= MAX_USERS_PER_IP_BAN:
                 return True, "ip_farm"
 
     return False, ""
@@ -885,6 +890,14 @@ def parse_telegram_webapp_handshake(init_data: str) -> dict | None:
         return None
 
 async def execute_network_vpn_lookup(client_ip: str) -> bool:
+    """
+    VPN CHECK — v3 FIX:
+    ቀደም ሲል 'operator' field ሲኖር True ይመልስ ነበር።
+    ችግሩ: 'operator' = ISP ስም ነው (Ethio Telecom, Safaricom ሁሉም አላቸው)
+    ስለዚህ ሁሉም legitimate Ethiopian users ይታገዱ ነበር።
+
+    አሁን: type = "VPN" ወይም "TOR" ብቻ ሲሆን True ይመልሳል።
+    """
     if not client_ip or client_ip in ("127.0.0.1", "::1", "unknown"):
         return False
     try:
@@ -894,14 +907,10 @@ async def execute_network_vpn_lookup(client_ip: str) -> bool:
             r = await c.get(url)
             payload = r.json()
             d = payload.get(client_ip, {})
-            ptype    = (d.get("type") or "").upper()
-            operator = d.get("operator")
-            logger.info(f"proxycheck result ip={client_ip} raw={d}")
-            if ptype in ("VPN", "TOR"):
-                return True
-            if operator and isinstance(operator, dict) and operator.get("name"):
-                return True
-            return False
+            ptype = (d.get("type") or "").upper()
+            logger.info(f"proxycheck result ip={client_ip} type={ptype}")
+            # FIX: operator check ሙሉ በሙሉ ተወግዷል — VPN/TOR type ብቻ
+            return ptype in ("VPN", "TOR")
     except Exception:
         logger.warning(f"proxycheck lookup failed for ip={client_ip}")
         return False
@@ -1487,7 +1496,6 @@ async def process_search_execute(message: Message, state: FSMContext):
     canvas   = (verif['canvas_hash'][:16] + "…" if verif and verif.get('canvas_hash') else "N/A")
     webgl    = (verif['webgl_hash'][:16]  + "…" if verif and verif.get('webgl_hash')  else "N/A")
 
-    # Show any fraud log entries for this user
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
@@ -1751,8 +1759,6 @@ async def execute_verification(request: Request):
 
     tg_platform    = str(data.get("tgPlatform",    "")).strip()[:50]
     tg_version     = str(data.get("tgVersion",     "")).strip()[:30]
-    # Fixed: tgAppVersion now correctly carries platform+version identifier,
-    # not language_code (which was the bug in the old index.html)
     tg_app_version = str(data.get("tgAppVersion",  "")).strip()[:30]
 
     canvas_hash = str(data.get("canvasHash",  "")).strip()[:64]
@@ -1764,11 +1770,9 @@ async def execute_verification(request: Request):
 
     fingerprint = data.get("fingerprint", "").strip()
 
-    # ── Missing fingerprint: soft block, NOT permanent ban ─────────────────
-    # Old phones or JS errors may fail to generate fingerprint.
-    # We block verification but don't ban — user can retry.
+    # ── Missing fingerprint: soft block ────────────────────────────────────
     if not fingerprint or fingerprint in ("undefined", "null", ""):
-        logger.warning(f"[NO-FP] uid={uid} ip={client_ip} — soft block, not banning")
+        logger.warning(f"[NO-FP] uid={uid} ip={client_ip} — soft block")
         await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
         return JSONResponse({"status": "blocked", "reason": "no_fingerprint"})
 
@@ -1805,12 +1809,10 @@ async def execute_verification(request: Request):
         logger.warning(f"[FRAUD-BAN] uid={uid} reason={ban_reason} ip={client_ip}")
         return JSONResponse({"status": "blocked", "reason": ban_reason})
 
-    # ── VPN check: soft block only, no ban, no IP blacklist ───────────────
-    # VPN users might just be privacy-conscious. Block verification
-    # but don't permanently penalize them.
+    # ── VPN check — soft block, no ban ────────────────────────────────────
     is_vpn = await execute_network_vpn_lookup(client_ip)
     if is_vpn:
-        logger.info(f"[VPN-BLOCK] uid={uid} ip={client_ip} — soft block, not banning")
+        logger.info(f"[VPN-BLOCK] uid={uid} ip={client_ip} — soft block")
         await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
         return JSONResponse({"status": "blocked", "reason": "vpn"})
 
