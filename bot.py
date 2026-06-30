@@ -1041,7 +1041,16 @@ async def process_balance_query(callback: CallbackQuery):
     if not await DataEngine.is_verified(uid):
         if not await enforce_membership_gate(callback, uid):
             return
-    acc   = await DataEngine.get_user(uid)
+    acc = await DataEngine.get_user(uid)
+    if acc is None:
+        # Self-heal: this account has a verifications row (so is_verified
+        # was True) but somehow never got a users row — most commonly
+        # caused by the admin "Full Unban" path before this fix. Create
+        # the missing row instead of crashing.
+        await DataEngine.create_user(
+            uid, callback.from_user.username or "", callback.from_user.full_name or ""
+        )
+        acc = await DataEngine.get_user(uid)
     min_w = await DataEngine.get_setting("min_withdrawal", "50")
     await callback.message.edit_text(
         f"💰 <b>Your Available Balance:</b>\n\n"
@@ -1200,7 +1209,13 @@ async def process_withdrawal_start(callback: CallbackQuery, state: FSMContext):
     if not await DataEngine.is_verified(uid):
         if not await enforce_membership_gate(callback, uid):
             return
-    user  = await DataEngine.get_user(uid)
+    user = await DataEngine.get_user(uid)
+    if user is None:
+        # Self-heal — see explanation in process_balance_query above.
+        await DataEngine.create_user(
+            uid, callback.from_user.username or "", callback.from_user.full_name or ""
+        )
+        user = await DataEngine.get_user(uid)
     min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
     current_bal = round(float(user["balance"]), 2)
     if current_bal < min_w:
@@ -1949,6 +1964,13 @@ async def process_full_unban_start(callback: CallbackQuery, state: FSMContext):
 async def process_full_unban_execute(message: Message, state: FSMContext):
     try:
         target = int(message.text.strip())
+        # IMPORTANT: inject_fake_verification() writes straight into the
+        # verifications table, which makes is_verified(target)=True even
+        # if there's no row for this user in `users` yet. Without this
+        # line, such a user would crash balance/withdraw with
+        # "'NoneType' object is not subscriptable" the moment they tap a
+        # dashboard button, because get_user() returns None.
+        await DataEngine.create_user(target, "", "")
         await DataEngine.ban_user(target, 0)
         await DataEngine.inject_fake_verification(target)
         await state.clear()
