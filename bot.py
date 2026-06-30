@@ -3,6 +3,7 @@
                     TELEGRAM ADVANCED REFERRAL BOT SYSTEM
    [ v4: Softer fraud rules (fewer false-positive bans), stale verify-widget
      cleanup on every /start, and a resumable "stop bot" admin control. ]
+     [ v4.1: Performance indexes + faster referral metrics for large user bases ]
          [ One person = One account. Shared IP alone is NOT a ban reason.    ]
 ================================================================================
 """
@@ -205,6 +206,24 @@ CREATE TABLE IF NOT EXISTS fraud_log (
     logged_at   TEXT    DEFAULT (datetime('now'))
 );
 
+-- ─────────────────────────────────────────────────────────────────────────
+-- PERFORMANCE INDEXES
+-- ብዙ users ሲኖሩ balance/referrals/withdraw ቁልፎች የሚጠቀሙባቸውን query ዎች
+-- (referred_by lookups, fingerprint/ip correlation, withdrawal status)
+-- ፈጣን ለማድረግ። IF NOT EXISTS ስለሆነ deploy በተደጋጋመ ቁጥር ምንም ችግር አይፈጥርም።
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_users_referred_by   ON users(referred_by);
+CREATE INDEX IF NOT EXISTS idx_users_is_banned     ON users(is_banned);
+CREATE INDEX IF NOT EXISTS idx_verif_fingerprint   ON verifications(fingerprint);
+CREATE INDEX IF NOT EXISTS idx_verif_ip            ON verifications(ip_address);
+CREATE INDEX IF NOT EXISTS idx_verif_canvas_webgl  ON verifications(canvas_hash, webgl_hash);
+CREATE INDEX IF NOT EXISTS idx_verif_tg_device     ON verifications(tg_platform, tg_version);
+CREATE INDEX IF NOT EXISTS idx_withdrawals_status  ON withdrawals(status);
+CREATE INDEX IF NOT EXISTS idx_withdrawals_user    ON withdrawals(user_id);
+CREATE INDEX IF NOT EXISTS idx_fraud_log_logged_at ON fraud_log(logged_at);
+CREATE INDEX IF NOT EXISTS idx_fraud_log_user      ON fraud_log(user_id);
+CREATE INDEX IF NOT EXISTS idx_banned_ips_ip        ON banned_ips(ip_address);
+
 INSERT OR IGNORE INTO settings (key, value) VALUES ('reward_per_referral', '10');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdrawal', '50');
 
@@ -261,6 +280,13 @@ class DataEngine:
                     await db.commit()
                 except Exception:
                     pass
+            # Run ANALYZE once at startup so SQLite's query planner picks
+            # good index strategies once the table has data.
+            try:
+                await db.execute("ANALYZE")
+                await db.commit()
+            except Exception:
+                pass
 
     @staticmethod
     async def get_user(user_id: int):
@@ -288,12 +314,21 @@ class DataEngine:
 
     @staticmethod
     async def get_referral_metrics(user_id: int):
+        """
+        Direct + tier-2 referral counts.
+        Tier-2 now uses an explicit JOIN instead of a correlated subquery —
+        with the idx_users_referred_by index this lets SQLite do two fast
+        index lookups instead of a nested scan, which matters once the
+        users table is large.
+        """
         async with aiosqlite.connect(DB_PATH) as db:
             cur1 = await db.execute("SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,))
             direct_count = (await cur1.fetchone())[0] or 0
             cur2 = await db.execute(
-                "SELECT COUNT(*) FROM users WHERE referred_by IN "
-                "(SELECT user_id FROM users WHERE referred_by = ?)", (user_id,)
+                "SELECT COUNT(*) FROM users u2 "
+                "JOIN users u1 ON u2.referred_by = u1.user_id "
+                "WHERE u1.referred_by = ?",
+                (user_id,)
             )
             tier2_count = (await cur2.fetchone())[0] or 0
             return direct_count, tier2_count
