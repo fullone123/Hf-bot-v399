@@ -3,6 +3,7 @@
                     TELEGRAM ADVANCED REFERRAL BOT SYSTEM
          [ Upgraded Production Engine - High Traffic & Safe Logs ]
          [ Security Patched: Double-spend, Rate-limit, IP check, Clone detect ]
+         [ v2 Fix: Reduced false-positive bans on shared networks/devices ]
 ================================================================================
 """
 
@@ -118,6 +119,9 @@ CREATE TABLE IF NOT EXISTS verifications (
     tg_platform     TEXT    DEFAULT '',
     tg_version      TEXT    DEFAULT '',
     tg_app_version  TEXT    DEFAULT '',
+    canvas_hash     TEXT    DEFAULT '',
+    webgl_hash      TEXT    DEFAULT '',
+    screen_sig      TEXT    DEFAULT '',
     verified_at     TEXT    DEFAULT (datetime('now'))
 );
 
@@ -158,6 +162,15 @@ CREATE TABLE IF NOT EXISTS banned_ips (
     banned_at   TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS fraud_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER,
+    reason      TEXT,
+    ip_address  TEXT,
+    details     TEXT    DEFAULT '',
+    logged_at   TEXT    DEFAULT (datetime('now'))
+);
+
 INSERT OR IGNORE INTO settings (key, value) VALUES ('reward_per_referral', '10');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdrawal', '50');
 
@@ -170,12 +183,14 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE verifications ADD COLUMN tg_platform    TEXT DEFAULT ''",
     "ALTER TABLE verifications ADD COLUMN tg_version     TEXT DEFAULT ''",
     "ALTER TABLE verifications ADD COLUMN tg_app_version TEXT DEFAULT ''",
-]
-
-MIGRATION_STATEMENTS_V2 = [
-    "ALTER TABLE verifications ADD COLUMN canvas_hash TEXT DEFAULT ''",
-    "ALTER TABLE verifications ADD COLUMN webgl_hash  TEXT DEFAULT ''",
-    "ALTER TABLE verifications ADD COLUMN screen_sig  TEXT DEFAULT ''",
+    "ALTER TABLE verifications ADD COLUMN canvas_hash    TEXT DEFAULT ''",
+    "ALTER TABLE verifications ADD COLUMN webgl_hash     TEXT DEFAULT ''",
+    "ALTER TABLE verifications ADD COLUMN screen_sig     TEXT DEFAULT ''",
+    """CREATE TABLE IF NOT EXISTS fraud_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER, reason TEXT, ip_address TEXT,
+        details TEXT DEFAULT '', logged_at TEXT DEFAULT (datetime('now'))
+    )""",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -202,7 +217,7 @@ class DataEngine:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.executescript(SCHEMA)
             await db.commit()
-            for stmt in MIGRATION_STATEMENTS + MIGRATION_STATEMENTS_V2:
+            for stmt in MIGRATION_STATEMENTS:
                 try:
                     await db.execute(stmt)
                     await db.commit()
@@ -336,6 +351,27 @@ class DataEngine:
             await db.commit()
 
     @staticmethod
+    async def log_fraud_attempt(user_id: int, reason: str, ip: str, details: str = ""):
+        """Log fraud suspicion without banning — for admin review."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO fraud_log (user_id, reason, ip_address, details) VALUES (?,?,?,?)",
+                (user_id, reason, ip, details),
+            )
+            await db.commit()
+
+    @staticmethod
+    async def count_ip_users(ip: str) -> int:
+        """Count how many verified users share the same IP."""
+        if not ip or ip in ("127.0.0.1", "::1", "unknown", "BYPASS_ADMIN"):
+            return 0
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM verifications WHERE ip_address = ?", (ip,)
+            )
+            return (await cur.fetchone())[0] or 0
+
+    @staticmethod
     async def create_withdrawal_atomic(
         user_id: int, amount: float, full_name: str, phone: str
     ) -> tuple[int, bool]:
@@ -441,8 +477,21 @@ class DataEngine:
             await db.commit()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FRAUD DETECTION ENGINE
+# FRAUD DETECTION ENGINE  (v2 — reduced false positives)
+#
+# PHILOSOPHY:
+#   • Self-referral          → ALWAYS ban  (intentional, clear fraud)
+#   • Same device + same IP  → ban         (very high confidence clone)
+#   • Same IP only           → LOG only    (could be family / office WiFi)
+#   • Canvas+WebGL+IP match  → ban         (hardware clone confirmed)
+#   • Canvas+WebGL only      → LOG only    (same phone model is common)
+#   • TG device clone        → must also share IP or fingerprint to ban
+#   • Missing fingerprint    → soft block, NOT ban (old phone / JS error)
 # ─────────────────────────────────────────────────────────────────────────────
+
+# How many users from the same IP is suspicious (shared WiFi threshold)
+MAX_USERS_PER_IP = 5
+
 async def evaluate_clone_risk(
     new_user_id: int,
     referrer_id: int,
@@ -455,118 +504,132 @@ async def evaluate_clone_risk(
     webgl_hash: str = "",
     screen_sig: str = "",
 ) -> tuple[bool, str]:
+    """
+    Returns (should_ban: bool, reason: str).
+    Only returns True when confidence of fraud is HIGH.
+    Suspicious-but-uncertain cases are logged without banning.
+    """
 
+    # ── 1. Self-referral — always ban, crystal clear ──────────────────────
     if referrer_id and referrer_id == new_user_id:
         return True, "self_invite"
 
     ip_ok = client_ip and client_ip not in ("127.0.0.1", "::1", "unknown")
 
+    # ── 2. Compare against referrer's verification record ─────────────────
     if ip_ok and referrer_id:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT ip_address, fingerprint, tg_platform, tg_version, tg_app_version "
-                "FROM verifications WHERE user_id = ?",
+                "SELECT ip_address, fingerprint FROM verifications WHERE user_id = ?",
                 (referrer_id,)
             )
             inv_row = await cur.fetchone()
             if inv_row:
                 inv_ip = inv_row["ip_address"] or ""
                 inv_fp = inv_row["fingerprint"] or ""
+                is_real_ip = inv_ip not in ("", "127.0.0.1", "::1", "unknown", "BYPASS_ADMIN")
 
-                if inv_ip not in ("", "127.0.0.1", "::1", "unknown", "BYPASS_ADMIN") \
-                        and inv_ip == client_ip:
-
-                    if fingerprint and inv_fp:
-                        if inv_fp == fingerprint:
-                            return True, "same_device_as_referrer"
-                        else:
-                            logger.warning(
-                                f"[FRAUD-WARN] Same IP diff device: "
-                                f"ref={referrer_id} new={new_user_id} ip={client_ip}"
-                            )
+                if is_real_ip and inv_ip == client_ip:
+                    if fingerprint and inv_fp and inv_fp == fingerprint:
+                        # Same device + same IP as referrer → definite clone
+                        return True, "same_device_as_referrer"
                     else:
-                        return True, "same_ip_as_referrer"
+                        # Same IP only → could be family WiFi, just log it
+                        logger.warning(
+                            f"[FRAUD-WARN] Shared IP with referrer (not banning): "
+                            f"ref={referrer_id} new={new_user_id} ip={client_ip}"
+                        )
+                        await DataEngine.log_fraud_attempt(
+                            new_user_id, "shared_ip_with_referrer", client_ip,
+                            f"referrer={referrer_id}"
+                        )
+                        # Do NOT ban — shared WiFi is common
 
-    if not ip_ok or not fingerprint:
-        return False, ""
+    # ── 3. Exact fingerprint match with any existing user ─────────────────
+    if ip_ok and fingerprint:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-
-        if referrer_id:
+            # Same fingerprint + same IP as any other user → ban
             cur = await db.execute(
                 "SELECT user_id FROM verifications "
-                "WHERE user_id = ? AND ip_address = ? AND fingerprint = ?",
-                (referrer_id, client_ip, fingerprint),
+                "WHERE ip_address = ? AND fingerprint = ? AND user_id != ? LIMIT 1",
+                (client_ip, fingerprint, new_user_id),
             )
             if await cur.fetchone():
-                return True, "clone_of_referrer"
+                return True, "clone_of_existing"
 
-        cur = await db.execute(
-            "SELECT user_id FROM verifications "
-            "WHERE ip_address = ? AND fingerprint = ? AND user_id != ? LIMIT 1",
-            (client_ip, fingerprint, new_user_id),
-        )
-        if await cur.fetchone():
-            return True, "clone_of_existing"
-
-        if tg_platform and tg_version and fingerprint:
+    # ── 4. Canvas + WebGL hardware clone check ────────────────────────────
+    #    Require BOTH canvas AND webgl AND same IP to ban.
+    #    Canvas alone is not enough — same phone model gives same hash.
+    if (canvas_hash and len(canvas_hash) > 8
+            and webgl_hash and len(webgl_hash) > 8
+            and ip_ok):
+        async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
                 "SELECT user_id FROM verifications "
-                "WHERE tg_platform = ? AND tg_version = ? AND fingerprint = ? "
+                "WHERE canvas_hash = ? AND webgl_hash = ? AND ip_address = ? "
                 "AND user_id != ? LIMIT 1",
-                (tg_platform, tg_version, fingerprint, new_user_id),
+                (canvas_hash, webgl_hash, client_ip, new_user_id),
             )
-            existing = await cur.fetchone()
-            if existing:
-                logger.warning(
-                    f"[FRAUD] TG device clone: uid={new_user_id} "
-                    f"matches uid={existing['user_id']} "
-                    f"platform={tg_platform} ver={tg_version}"
-                )
-                return True, "clone_tg_device"
+            if await cur.fetchone():
+                return True, "clone_hardware"
 
-        if tg_app_version and fingerprint:
+        # Canvas + WebGL match without IP → only log, don't ban
+        async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
                 "SELECT user_id FROM verifications "
-                "WHERE tg_app_version = ? AND fingerprint = ? "
-                "AND user_id != ? LIMIT 1",
-                (tg_app_version, fingerprint, new_user_id),
-            )
-            existing = await cur.fetchone()
-            if existing:
-                logger.warning(
-                    f"[FRAUD] Same TG install clone: uid={new_user_id} "
-                    f"matches uid={existing['user_id']} "
-                    f"tg_app_version={tg_app_version}"
-                )
-                return True, "clone_tg_install"
-
-        if canvas_hash and len(canvas_hash) > 8:
-            cur = await db.execute(
-                "SELECT user_id FROM verifications "
-                "WHERE canvas_hash = ? AND user_id != ? LIMIT 1",
-                (canvas_hash, new_user_id),
+                "WHERE canvas_hash = ? AND webgl_hash = ? AND user_id != ? LIMIT 1",
+                (canvas_hash, webgl_hash, new_user_id),
             )
             row = await cur.fetchone()
             if row:
-                cur2 = await db.execute(
-                    "SELECT user_id FROM verifications "
-                    "WHERE canvas_hash = ? AND ip_address = ? AND user_id != ? LIMIT 1",
-                    (canvas_hash, client_ip, new_user_id),
+                logger.warning(
+                    f"[FRAUD-WARN] Same canvas+webgl different IP (not banning): "
+                    f"uid={new_user_id} matches uid={row['user_id']}"
                 )
-                if await cur2.fetchone():
-                    return True, "clone_canvas_ip"
+                await DataEngine.log_fraud_attempt(
+                    new_user_id, "same_hardware_diff_ip", client_ip,
+                    f"matches_uid={row['user_id']}"
+                )
 
-                if webgl_hash and len(webgl_hash) > 8:
-                    cur3 = await db.execute(
-                        "SELECT user_id FROM verifications "
-                        "WHERE canvas_hash = ? AND webgl_hash = ? AND user_id != ? LIMIT 1",
-                        (canvas_hash, webgl_hash, new_user_id),
-                    )
-                    if await cur3.fetchone():
-                        return True, "clone_hardware"
+    # ── 5. TG device clone — must share IP or fingerprint to ban ──────────
+    #    tg_platform + tg_version alone is too common (many users on same
+    #    Telegram version), so we require a corroborating signal.
+    if tg_platform and tg_version and fingerprint and ip_ok:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT user_id FROM verifications "
+                "WHERE tg_platform = ? AND tg_version = ? AND ip_address = ? "
+                "AND fingerprint = ? AND user_id != ? LIMIT 1",
+                (tg_platform, tg_version, client_ip, fingerprint, new_user_id),
+            )
+            existing = await cur.fetchone()
+            if existing:
+                logger.warning(
+                    f"[FRAUD] TG device clone confirmed: uid={new_user_id} "
+                    f"matches uid={existing['user_id']} "
+                    f"platform={tg_platform} ver={tg_version} ip={client_ip}"
+                )
+                return True, "clone_tg_device"
+
+    # ── 6. Excessive users from one IP (bot farm detection) ───────────────
+    #    Do not ban — just log for admin review.
+    if ip_ok:
+        ip_count = await DataEngine.count_ip_users(client_ip)
+        if ip_count >= MAX_USERS_PER_IP:
+            logger.warning(
+                f"[FRAUD-WARN] High IP usage: ip={client_ip} "
+                f"count={ip_count} new_uid={new_user_id}"
+            )
+            await DataEngine.log_fraud_attempt(
+                new_user_id, "high_ip_usage", client_ip,
+                f"existing_users_on_ip={ip_count}"
+            )
+            # Only ban if absurdly high (likely a bot farm, not a school WiFi)
+            if ip_count >= MAX_USERS_PER_IP * 4:
+                return True, "ip_farm"
 
     return False, ""
 
@@ -885,6 +948,7 @@ def generate_admin_dashboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📢 Broadcast Message",   callback_data="adm_cmd_broadcast"),
         ],
         [InlineKeyboardButton(text="🔍 Search User",            callback_data="adm_cmd_search")],
+        [InlineKeyboardButton(text="⚠️ Fraud Log",              callback_data="adm_cmd_fraud_log")],
         [
             InlineKeyboardButton(text="🚫 Ban User",            callback_data="adm_cmd_ban"),
             InlineKeyboardButton(text="✅ Unban Dashboard",     callback_data="adm_cmd_unban_menu"),
@@ -1081,6 +1145,36 @@ async def process_admin_view_invites(callback: CallbackQuery):
         reply_markup=generate_fallback_navigation("ui_admin_core")
     )
     await callback.answer()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN — FRAUD LOG
+# ─────────────────────────────────────────────────────────────────────────────
+@core_router.callback_query(F.data == "adm_cmd_fraud_log")
+async def process_fraud_log(callback: CallbackQuery):
+    if not evaluate_admin_access(callback.from_user.id):
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM fraud_log ORDER BY logged_at DESC LIMIT 20"
+        )
+        rows = await cur.fetchall()
+    if not rows:
+        return await callback.message.edit_text(
+            "📭 No fraud attempts logged.", reply_markup=generate_fallback_navigation("ui_admin_core")
+        )
+    lines = []
+    for r in rows:
+        lines.append(
+            f"⚠️ <code>{r['reason']}</code>\n"
+            f"   uid=<code>{r['user_id']}</code> ip=<code>{r['ip_address']}</code>\n"
+            f"   {r['details']}\n"
+            f"   🕐 {r['logged_at']}"
+        )
+    await callback.message.edit_text(
+        f"⚠️ <b>Fraud Log (last 20):</b>\n\n" + "\n\n".join(lines),
+        reply_markup=generate_fallback_navigation("ui_admin_core")
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ADMIN — APPROVE WITHDRAWAL
@@ -1356,11 +1450,14 @@ async def process_stats(callback: CallbackQuery):
         row  = await cur.fetchone()
         cur2 = await db.execute("SELECT COUNT(*) FROM banned_ips")
         ip_count = (await cur2.fetchone())[0] or 0
+        cur3 = await db.execute("SELECT COUNT(*) FROM fraud_log")
+        fraud_count = (await cur3.fetchone())[0] or 0
     await callback.message.edit_text(
         f"📊 <b>Bot Analytics:</b>\n\n"
         f"• Registered Users: <b>{row[0] or 0}</b>\n"
         f"• Outstanding Liabilities: <b>{float(row[1] or 0.0):.2f} ETB</b>\n"
-        f"• Banned IPs: <b>{ip_count}</b>",
+        f"• Banned IPs: <b>{ip_count}</b>\n"
+        f"• Fraud Log Entries: <b>{fraud_count}</b>",
         reply_markup=generate_fallback_navigation("ui_admin_core")
     )
 
@@ -1389,6 +1486,21 @@ async def process_search_execute(message: Message, state: FSMContext):
     tg_app   = (verif['tg_app_version'] or "N/A") if verif else "N/A"
     canvas   = (verif['canvas_hash'][:16] + "…" if verif and verif.get('canvas_hash') else "N/A")
     webgl    = (verif['webgl_hash'][:16]  + "…" if verif and verif.get('webgl_hash')  else "N/A")
+
+    # Show any fraud log entries for this user
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT reason, logged_at FROM fraud_log WHERE user_id = ? ORDER BY logged_at DESC LIMIT 3",
+            (target,)
+        )
+        fraud_rows = await cur.fetchall()
+    fraud_txt = ""
+    if fraud_rows:
+        fraud_txt = "\n⚠️ <b>Fraud Flags:</b>\n" + "\n".join(
+            f"  • <code>{r['reason']}</code> @ {r['logged_at']}" for r in fraud_rows
+        )
+
     await message.answer(
         f"👤 <b>User Profile:</b>\n\n"
         f"• Name: {sanitize_html(user['full_name'])}\n"
@@ -1404,7 +1516,8 @@ async def process_search_execute(message: Message, state: FSMContext):
         f"• TG App Version: <b>{tg_app}</b>\n"
         f"• Canvas Hash: <code>{canvas}</code>\n"
         f"• WebGL Hash: <code>{webgl}</code>\n"
-        f"• Joined: {user['joined_at']}",
+        f"• Joined: {user['joined_at']}"
+        f"{fraud_txt}",
         reply_markup=generate_admin_dashboard()
     )
 
@@ -1638,6 +1751,8 @@ async def execute_verification(request: Request):
 
     tg_platform    = str(data.get("tgPlatform",    "")).strip()[:50]
     tg_version     = str(data.get("tgVersion",     "")).strip()[:30]
+    # Fixed: tgAppVersion now correctly carries platform+version identifier,
+    # not language_code (which was the bug in the old index.html)
     tg_app_version = str(data.get("tgAppVersion",  "")).strip()[:30]
 
     canvas_hash = str(data.get("canvasHash",  "")).strip()[:64]
@@ -1648,9 +1763,13 @@ async def execute_verification(request: Request):
         return JSONResponse({"status": "already_verified"})
 
     fingerprint = data.get("fingerprint", "").strip()
+
+    # ── Missing fingerprint: soft block, NOT permanent ban ─────────────────
+    # Old phones or JS errors may fail to generate fingerprint.
+    # We block verification but don't ban — user can retry.
     if not fingerprint or fingerprint in ("undefined", "null", ""):
+        logger.warning(f"[NO-FP] uid={uid} ip={client_ip} — soft block, not banning")
         await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
-        await DataEngine.ban_user(uid, 1)
         return JSONResponse({"status": "blocked", "reason": "no_fingerprint"})
 
     logger.info(
@@ -1686,8 +1805,12 @@ async def execute_verification(request: Request):
         logger.warning(f"[FRAUD-BAN] uid={uid} reason={ban_reason} ip={client_ip}")
         return JSONResponse({"status": "blocked", "reason": ban_reason})
 
+    # ── VPN check: soft block only, no ban, no IP blacklist ───────────────
+    # VPN users might just be privacy-conscious. Block verification
+    # but don't permanently penalize them.
     is_vpn = await execute_network_vpn_lookup(client_ip)
     if is_vpn:
+        logger.info(f"[VPN-BLOCK] uid={uid} ip={client_ip} — soft block, not banning")
         await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
         return JSONResponse({"status": "blocked", "reason": "vpn"})
 
