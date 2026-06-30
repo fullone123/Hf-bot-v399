@@ -49,6 +49,11 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("ReferralBotSystem")
+logger.info("════════════════════════════════════════════════")
+logger.info("  BOT CODE VERSION: v4.2-debug-2026-06-30")
+logger.info("  If you don't see this line after deploy/restart,")
+logger.info("  the OLD code is still running on Railway.")
+logger.info("════════════════════════════════════════════════")
 
 BOT_TOKEN            = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS            = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") if x.strip()]
@@ -836,6 +841,28 @@ class AdminConsoleWorkflow(StatesGroup):
 bot         = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp          = Dispatcher(storage=MemoryStorage())
 core_router = Router()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEBUG: catch-all callback logger
+#
+# Registered as a plain middleware-style outer handler so EVERY incoming
+# callback_query is logged before any filter-specific handler runs. If a
+# button tap produces zero output in Railway logs, this proves the update
+# never reached the bot process at all (Telegram delivery / polling issue,
+# not a code-logic bug) — vs. seeing this log line but no further handler
+# log, which would point at a filter mismatch instead.
+# ─────────────────────────────────────────────────────────────────────────────
+@core_router.callback_query.middleware()
+async def debug_log_all_callbacks(handler, event: CallbackQuery, data):
+    logger.info(f"[CALLBACK-IN] uid={event.from_user.id} data={event.data!r}")
+    try:
+        return await handler(event, data)
+    except Exception as e:
+        logger.exception(f"[CALLBACK-ERROR] uid={event.from_user.id} data={event.data!r}: {e}")
+        try:
+            await event.answer("⚠️ Internal error, please try again.", show_alert=True)
+        except Exception:
+            pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FORCE JOIN LOGIC
@@ -1939,7 +1966,15 @@ async def process_full_unban_execute(message: Message, state: FSMContext):
 async def application_lifespan(app: FastAPI):
     global _polling_task
     await DataEngine.init_database()
-    _polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
+
+    async def _run_polling():
+        try:
+            logger.info("[POLLING] Starting Telegram long-polling...")
+            await dp.start_polling(bot, skip_updates=True)
+        except Exception:
+            logger.exception("[POLLING] Polling task crashed and stopped! No updates will be received until restart.")
+
+    _polling_task = asyncio.create_task(_run_polling())
     yield
 
 api_platform = FastAPI(lifespan=application_lifespan)
