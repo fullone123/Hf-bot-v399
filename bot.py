@@ -1,8 +1,9 @@
 """
 ================================================================================
                     TELEGRAM ADVANCED REFERRAL BOT SYSTEM
-         [ v3 Fix: Fingerprint-first clone detection, VPN operator bug fixed ]
-         [ One person = One account. Shared IP alone is NOT a ban reason.    ]
+         [ Upgraded Production Engine - High Traffic & Safe Logs ]
+         [ Security Patched: Double-spend, Rate-limit, IP check, Clone detect ]
+         [ v3: Confidence Score System + False Positive Reduction ]
 ================================================================================
 """
 
@@ -70,14 +71,30 @@ BOT_RULES_CAPTION = (
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FRAUD BAN SCORES — HARDENED SIGNALS ONLY
+# ─────────────────────────────────────────────────────────────────────────────
+# ይህ ስርዓት client-side spoofable data (canvas/webgl/tg_version) ላይ ጥገኛ ሆኖ
+# ban አያደርግም — ንፁህ ሰው በስህተት እንዳይታገድ ቅድሚያ ተሰጥቷል። Server-verified
+# signals (IP፣ exact fingerprint match) ብቻ ናቸው ban የሚያስከትሉት።
+SCORE_SELF_INVITE             = 100   # ቀጥተኛ self-invite → always ban
+SCORE_SAME_IP_AS_REFERRER     = 100   # ✅ ተጋባዥ+ጋባዥ IP same → instant ban (ባለቤቱ ውሳኔ)
+SCORE_SAME_DEVICE_AS_REFERRER = 100   # IP + fingerprint ሁለቱም same → ban
+SCORE_CLONE_OF_REFERRER       = 100   # fingerprint + IP = referrer → ban
+SCORE_CLONE_OF_EXISTING       = 100   # fingerprint + IP = any user → ban
+# NOTE: tg_device / tg_install / canvas / webgl ላይ የተመሰረቱ scores ሙሉ ተወግደዋል
+# (evaluate_clone_risk ውስጥ) — እነዚህ "soft signals" ናቸው፣ log ብቻ ይደረጋሉ፣
+# ፈጽሞ ban አያስከትሉም።
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # RATE LIMITER
 # ─────────────────────────────────────────────────────────────────────────────
 class RateLimiter:
     def __init__(self, max_calls: int = 5, window_seconds: int = 60):
-        self.max_calls     = max_calls
-        self.window        = window_seconds
-        self._calls: dict  = defaultdict(list)
-        self._lock         = asyncio.Lock()
+        self.max_calls    = max_calls
+        self.window       = window_seconds
+        self._calls: dict = defaultdict(list)
+        self._lock        = asyncio.Lock()
 
     async def is_allowed(self, key: str) -> bool:
         async with self._lock:
@@ -161,15 +178,6 @@ CREATE TABLE IF NOT EXISTS banned_ips (
     banned_at   TEXT DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS fraud_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id     INTEGER,
-    reason      TEXT,
-    ip_address  TEXT,
-    details     TEXT    DEFAULT '',
-    logged_at   TEXT    DEFAULT (datetime('now'))
-);
-
 INSERT OR IGNORE INTO settings (key, value) VALUES ('reward_per_referral', '10');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdrawal', '50');
 
@@ -185,11 +193,6 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE verifications ADD COLUMN canvas_hash    TEXT DEFAULT ''",
     "ALTER TABLE verifications ADD COLUMN webgl_hash     TEXT DEFAULT ''",
     "ALTER TABLE verifications ADD COLUMN screen_sig     TEXT DEFAULT ''",
-    """CREATE TABLE IF NOT EXISTS fraud_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER, reason TEXT, ip_address TEXT,
-        details TEXT DEFAULT '', logged_at TEXT DEFAULT (datetime('now'))
-    )""",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,10 +210,15 @@ def sanitize_html(text: str) -> str:
         .replace("'", "&#x27;")
     )
 
+def _is_real_ip(ip: str) -> bool:
+    """IP address ትክክለኛ እና private/bypass አይደለም።"""
+    return bool(ip) and ip not in ("127.0.0.1", "::1", "unknown", "BYPASS_ADMIN", "")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 class DataEngine:
+
     @staticmethod
     async def init_database():
         async with aiosqlite.connect(DB_PATH) as db:
@@ -221,7 +229,7 @@ class DataEngine:
                     await db.execute(stmt)
                     await db.commit()
                 except Exception:
-                    pass
+                    pass  # column already exists
 
     @staticmethod
     async def get_user(user_id: int):
@@ -243,14 +251,17 @@ class DataEngine:
     async def add_balance(user_id: int, amount: float):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "UPDATE users SET balance = ROUND(balance + ?, 2) WHERE user_id = ?", (amount, user_id)
+                "UPDATE users SET balance = ROUND(balance + ?, 2) WHERE user_id = ?",
+                (amount, user_id)
             )
             await db.commit()
 
     @staticmethod
     async def get_referral_metrics(user_id: int):
         async with aiosqlite.connect(DB_PATH) as db:
-            cur1 = await db.execute("SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,))
+            cur1 = await db.execute(
+                "SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,)
+            )
             direct_count = (await cur1.fetchone())[0] or 0
             cur2 = await db.execute(
                 "SELECT COUNT(*) FROM users WHERE referred_by IN "
@@ -264,14 +275,17 @@ class DataEngine:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT user_id, username, full_name, joined_at FROM users WHERE referred_by = ?", (user_id,)
+                "SELECT user_id, username, full_name, joined_at FROM users WHERE referred_by = ?",
+                (user_id,)
             )
             return await cur.fetchall()
 
     @staticmethod
     async def ban_user(user_id: int, status: int = 1):
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (status, user_id))
+            await db.execute(
+                "UPDATE users SET is_banned = ? WHERE user_id = ?", (status, user_id)
+            )
             await db.commit()
 
     @staticmethod
@@ -285,7 +299,8 @@ class DataEngine:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "INSERT OR REPLACE INTO verifications "
-                "(user_id, ip_address, user_agent, fingerprint, referrer_ip, tg_platform, tg_version, tg_app_version) "
+                "(user_id, ip_address, user_agent, fingerprint, referrer_ip, "
+                "tg_platform, tg_version, tg_app_version) "
                 "VALUES (?,?,?,?,?,?,?,?)",
                 (user_id, "BYPASS_ADMIN", "BYPASS_ADMIN", f"BYPASS_{user_id}", "", "", "", ""),
             )
@@ -294,7 +309,9 @@ class DataEngine:
     @staticmethod
     async def is_verified(user_id: int) -> bool:
         async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT id FROM verifications WHERE user_id = ?", (user_id,))
+            cur = await db.execute(
+                "SELECT id FROM verifications WHERE user_id = ?", (user_id,)
+            )
             return (await cur.fetchone()) is not None
 
     @staticmethod
@@ -328,59 +345,45 @@ class DataEngine:
     async def get_verification(user_id: int):
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT * FROM verifications WHERE user_id = ?", (user_id,))
+            cur = await db.execute(
+                "SELECT * FROM verifications WHERE user_id = ?", (user_id,)
+            )
             return await cur.fetchone()
 
     @staticmethod
     async def is_ip_banned(ip: str) -> bool:
-        if not ip or ip in ("127.0.0.1", "::1", "unknown", "BYPASS_ADMIN"):
+        if not _is_real_ip(ip):
             return False
         async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT ip_address FROM banned_ips WHERE ip_address = ?", (ip,))
+            cur = await db.execute(
+                "SELECT ip_address FROM banned_ips WHERE ip_address = ?", (ip,)
+            )
             return (await cur.fetchone()) is not None
 
     @staticmethod
     async def ban_ip(ip: str, reason: str):
-        if not ip or ip in ("127.0.0.1", "::1", "unknown", "BYPASS_ADMIN"):
+        if not _is_real_ip(ip):
             return
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "INSERT OR IGNORE INTO banned_ips (ip_address, reason) VALUES (?,?)", (ip, reason)
+                "INSERT OR IGNORE INTO banned_ips (ip_address, reason) VALUES (?,?)",
+                (ip, reason)
             )
             await db.commit()
-
-    @staticmethod
-    async def log_fraud_attempt(user_id: int, reason: str, ip: str, details: str = ""):
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT INTO fraud_log (user_id, reason, ip_address, details) VALUES (?,?,?,?)",
-                (user_id, reason, ip, details),
-            )
-            await db.commit()
-
-    @staticmethod
-    async def count_ip_users(ip: str) -> int:
-        if not ip or ip in ("127.0.0.1", "::1", "unknown", "BYPASS_ADMIN"):
-            return 0
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT COUNT(*) FROM verifications WHERE ip_address = ?", (ip,)
-            )
-            return (await cur.fetchone())[0] or 0
 
     @staticmethod
     async def create_withdrawal_atomic(
         user_id: int, amount: float, full_name: str, phone: str
     ) -> tuple[int, bool]:
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("BEGIN EXCLUSIVE")
             try:
+                await db.execute("BEGIN EXCLUSIVE")
                 cur = await db.execute(
                     "SELECT balance FROM users WHERE user_id = ?", (user_id,)
                 )
                 row = await cur.fetchone()
                 if not row or round(float(row[0]), 2) < round(amount, 2):
-                    await db.execute("ROLLBACK")
+                    await db.rollback()
                     return 0, False
 
                 cur2 = await db.execute(
@@ -392,10 +395,10 @@ class DataEngine:
                     "UPDATE users SET balance = ROUND(balance - ?, 2) WHERE user_id = ?",
                     (amount, user_id),
                 )
-                await db.execute("COMMIT")
+                await db.commit()
                 return tid, True
             except Exception as e:
-                await db.execute("ROLLBACK")
+                await db.rollback()
                 raise e
 
     @staticmethod
@@ -406,10 +409,13 @@ class DataEngine:
             return await cur.fetchone()
 
     @staticmethod
-    async def update_withdrawal_status(wid: int, status: str, post_id: int = 0, reason: str = ""):
+    async def update_withdrawal_status(
+        wid: int, status: str, post_id: int = 0, reason: str = ""
+    ):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "UPDATE withdrawals SET status=?, channel_post_id=?, reason=?, resolved_at=datetime('now') WHERE id=?",
+                "UPDATE withdrawals SET status=?, channel_post_id=?, reason=?, "
+                "resolved_at=datetime('now') WHERE id=?",
                 (status, post_id, reason, wid),
             )
             await db.commit()
@@ -418,14 +424,19 @@ class DataEngine:
     async def get_pending_withdrawals():
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT * FROM withdrawals WHERE status='pending' ORDER BY created_at")
+            cur = await db.execute(
+                "SELECT * FROM withdrawals WHERE status='pending' ORDER BY created_at"
+            )
             return await cur.fetchall()
 
     @staticmethod
-    async def add_force_channel(channel_id: str, channel_name: str, invite_link: str, bot_added: int = 0):
+    async def add_force_channel(
+        channel_id: str, channel_name: str, invite_link: str, bot_added: int = 0
+    ):
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "INSERT OR REPLACE INTO force_channels (channel_id, channel_name, invite_link, bot_added) VALUES (?,?,?,?)",
+                "INSERT OR REPLACE INTO force_channels "
+                "(channel_id, channel_name, invite_link, bot_added) VALUES (?,?,?,?)",
                 (channel_id, channel_name, invite_link, bot_added),
             )
             await db.commit()
@@ -440,13 +451,17 @@ class DataEngine:
     @staticmethod
     async def has_seen_fake_join(user_id: int) -> bool:
         async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT user_id FROM fake_join_seen WHERE user_id = ?", (user_id,))
+            cur = await db.execute(
+                "SELECT user_id FROM fake_join_seen WHERE user_id = ?", (user_id,)
+            )
             return (await cur.fetchone()) is not None
 
     @staticmethod
     async def mark_fake_join_seen(user_id: int):
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("INSERT OR IGNORE INTO fake_join_seen (user_id) VALUES (?)", (user_id,))
+            await db.execute(
+                "INSERT OR IGNORE INTO fake_join_seen (user_id) VALUES (?)", (user_id,)
+            )
             await db.commit()
 
     _settings_cache: dict = {}
@@ -457,29 +472,28 @@ class DataEngine:
         async with DataEngine._settings_lock:
             if key in DataEngine._settings_cache:
                 return DataEngine._settings_cache[key]
-            async with aiosqlite.connect(DB_PATH) as db:
-                db.row_factory = aiosqlite.Row
-                cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
-                row = await cur.fetchone()
-                val = row["value"] if row else default
-                DataEngine._settings_cache[key] = val
-                return val
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = await cur.fetchone()
+            val = row["value"] if row else default
+        async with DataEngine._settings_lock:
+            DataEngine._settings_cache[key] = val
+        return val
 
     @staticmethod
     async def set_setting(key: str, value: str):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value)
+            )
+            await db.commit()
         async with DataEngine._settings_lock:
             DataEngine._settings_cache[key] = value
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
-            await db.commit()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FRAUD DETECTION ENGINE  (v3 - FIXED)
+# FRAUD DETECTION ENGINE — Confidence Score System
 # ─────────────────────────────────────────────────────────────────────────────
-
-MAX_USERS_PER_IP      = 10
-MAX_USERS_PER_IP_BAN  = 40
-
 async def evaluate_clone_risk(
     new_user_id: int,
     referrer_id: int,
@@ -491,39 +505,33 @@ async def evaluate_clone_risk(
     canvas_hash: str = "",
     webgl_hash: str = "",
     screen_sig: str = "",
-) -> tuple[bool, str]:
+) -> tuple[bool, str, int]:
     """
-    Returns (should_ban: bool, reason: str).
-    High confidence fraud only → ban.
-    Uncertain → log for admin review.
-    """
+    HARDENED-SIGNAL-ONLY MODE — false-positive ቅነሳ ቅድሚያ ይሰጣል።
 
-    # ── 1. Self-referral ──────────────────────────────────────────────────
+    Ban የሚደረገው እነዚህ ምድቦች ብቻ ናቸው (ሁሉም server-verified, ቀላል spoof የማይደረጉ):
+      1. self_invite              — mathematically certain
+      2. same_ip_as_referrer /
+         same_device_as_referrer  — server-side IP comparison (ባለቤቱ ውሳኔ)
+      3. clone_of_referrer /
+         clone_of_existing        — server-side IP + fingerprint exact match
+
+    የተወገዱ checks (client-side spoofable ወይም collision-prone ስለሆኑ ሙሉ
+    ከ ban logic ወጥተዋል — false positive ምንጭ ነበሩ):
+      ✗ clone_tg_device   — tg_platform/version client ራሱ ይልካል፣ ቀላል spoof
+      ✗ clone_tg_install  — tg_app_version ተመሳሳይ ነገር
+      ✗ canvas/webgl      — ተመሳሳይ phone model ላይ ብዙ ጊዜ ይደጋገማል
+    እነዚህ "SOFT SIGNAL" ተብለው admin review ብቻ log ይደረጋሉ፣ ፈጽሞ ban አያስከትሉም።
+    """
+    ip_valid = _is_real_ip(client_ip)
+    fp_valid = bool(fingerprint) and fingerprint not in ("undefined", "null", "")
+
+    # ── 1. Self-invite (instant ban — mathematically certain) ────────────────
     if referrer_id and referrer_id == new_user_id:
-        return True, "self_invite"
+        return True, "self_invite", SCORE_SELF_INVITE
 
-    ip_ok = client_ip and client_ip not in ("127.0.0.1", "::1", "unknown")
-    fp_ok = fingerprint and fingerprint not in ("undefined", "null", "")
-
-    # ── 2. Fingerprint match vs ANY existing verified user ────────────────
-    if fp_ok:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                "SELECT user_id FROM verifications "
-                "WHERE fingerprint = ? AND user_id != ? LIMIT 1",
-                (fingerprint, new_user_id),
-            )
-            existing = await cur.fetchone()
-            if existing:
-                logger.warning(
-                    f"[FRAUD] Fingerprint match: new_uid={new_user_id} "
-                    f"matches uid={existing['user_id']} ip={client_ip}"
-                )
-                return True, "clone_of_existing"
-
-    # ── 3. Referrer device check ──────────────────────────────────────────
-    if referrer_id and fp_ok:
+    # ── 2. IP vs Referrer (server-verified — ባለቤቱ ውሳኔ መሰረት instant ban) ─────
+    if ip_valid and referrer_id:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
@@ -531,89 +539,94 @@ async def evaluate_clone_risk(
                 (referrer_id,)
             )
             inv_row = await cur.fetchone()
-            if inv_row:
-                inv_ip = inv_row["ip_address"] or ""
-                inv_fp = inv_row["fingerprint"] or ""
-                is_real_ip = inv_ip not in ("", "127.0.0.1", "::1", "unknown", "BYPASS_ADMIN")
 
-                if inv_fp and inv_fp == fingerprint:
-                    return True, "same_device_as_referrer"
+        if inv_row:
+            inv_ip = inv_row["ip_address"] or ""
+            inv_fp = inv_row["fingerprint"] or ""
 
-                if is_real_ip and inv_ip == client_ip:
+            if _is_real_ip(inv_ip) and inv_ip == client_ip:
+                if fp_valid and inv_fp and inv_fp == fingerprint:
                     logger.warning(
-                        f"[FRAUD-WARN] Shared IP with referrer (not banning): "
-                        f"ref={referrer_id} new={new_user_id} ip={client_ip}"
+                        f"[FRAUD] same_device_as_referrer uid={new_user_id} "
+                        f"ref={referrer_id} ip={client_ip}"
                     )
-                    await DataEngine.log_fraud_attempt(
-                        new_user_id, "shared_ip_with_referrer", client_ip,
-                        f"referrer={referrer_id}"
+                    return True, "same_device_as_referrer", SCORE_SAME_DEVICE_AS_REFERRER
+                else:
+                    logger.warning(
+                        f"[FRAUD] same_ip_as_referrer uid={new_user_id} "
+                        f"ref={referrer_id} ip={client_ip}"
                     )
+                    return True, "same_ip_as_referrer", SCORE_SAME_IP_AS_REFERRER
 
-    # ── 4. Canvas + WebGL hardware clone (BUG FIX: db.row_factory added) ──
-    if (canvas_hash and len(canvas_hash) > 8
-            and webgl_hash and len(webgl_hash) > 8):
+    if not ip_valid or not fp_valid:
+        return False, "", 0
 
-        if ip_ok:
-            async with aiosqlite.connect(DB_PATH) as db:
-                db.row_factory = aiosqlite.Row  # FIX: was missing
-                cur = await db.execute(
-                    "SELECT user_id FROM verifications "
-                    "WHERE canvas_hash = ? AND webgl_hash = ? AND ip_address = ? "
-                    "AND user_id != ? LIMIT 1",
-                    (canvas_hash, webgl_hash, client_ip, new_user_id),
-                )
-                if await cur.fetchone():
-                    return True, "clone_hardware"
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
 
-        # Canvas+WebGL match without IP → log only (same phone model)
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row  # FIX: was missing
+        # ── 3. Fingerprint + IP = referrer exact clone (server-verified) ─────
+        if referrer_id:
             cur = await db.execute(
                 "SELECT user_id FROM verifications "
-                "WHERE canvas_hash = ? AND webgl_hash = ? AND user_id != ? LIMIT 1",
-                (canvas_hash, webgl_hash, new_user_id),
+                "WHERE user_id = ? AND ip_address = ? AND fingerprint = ?",
+                (referrer_id, client_ip, fingerprint),
             )
-            row = await cur.fetchone()
-            if row:
+            if await cur.fetchone():
                 logger.warning(
-                    f"[FRAUD-WARN] Same canvas+webgl different IP (not banning): "
-                    f"uid={new_user_id} matches uid={row['user_id']}"
+                    f"[FRAUD] clone_of_referrer uid={new_user_id} ref={referrer_id}"
                 )
-                await DataEngine.log_fraud_attempt(
-                    new_user_id, "same_hardware_diff_ip", client_ip,
-                    f"matches_uid={row['user_id']}"
-                )
+                return True, "clone_of_referrer", SCORE_CLONE_OF_REFERRER
 
-    # ── 5. TG device clone ────────────────────────────────────────────────
-    if tg_platform and tg_version and fp_ok and ip_ok:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
+        # ── 4. Fingerprint + IP = any existing user (server-verified) ────────
+        cur = await db.execute(
+            "SELECT user_id FROM verifications "
+            "WHERE ip_address = ? AND fingerprint = ? AND user_id != ? LIMIT 1",
+            (client_ip, fingerprint, new_user_id),
+        )
+        existing = await cur.fetchone()
+        if existing:
+            logger.warning(
+                f"[FRAUD] clone_of_existing uid={new_user_id} "
+                f"matches={existing['user_id']}"
+            )
+            return True, "clone_of_existing", SCORE_CLONE_OF_EXISTING
+
+    # ── SOFT SIGNALS — log ብቻ፣ ban አይደረግም ─────────────────────────────────
+    # client-controllable (spoofable) ወይም collision-prone ስለሆኑ ብቻቸውን ወይም
+    # ተደምረው ban ምክንያት አይሆኑም። admin review ብቻ ይታገዛሉ።
+    soft_flags = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        if tg_platform and tg_version:
             cur = await db.execute(
                 "SELECT user_id FROM verifications "
-                "WHERE tg_platform = ? AND tg_version = ? AND ip_address = ? "
-                "AND fingerprint = ? AND user_id != ? LIMIT 1",
-                (tg_platform, tg_version, client_ip, fingerprint, new_user_id),
+                "WHERE tg_platform = ? AND tg_version = ? AND fingerprint = ? "
+                "AND user_id != ? LIMIT 1",
+                (tg_platform, tg_version, fingerprint, new_user_id),
             )
-            existing = await cur.fetchone()
-            if existing:
-                return True, "clone_tg_device"
+            if await cur.fetchone():
+                soft_flags.append("tg_device_match")
 
-    # ── 6. IP farm detection ──────────────────────────────────────────────
-    if ip_ok:
-        ip_count = await DataEngine.count_ip_users(client_ip)
-        if ip_count >= MAX_USERS_PER_IP:
-            logger.warning(
-                f"[FRAUD-WARN] High IP usage: ip={client_ip} "
-                f"count={ip_count} new_uid={new_user_id}"
+        canvas_valid = canvas_hash and len(canvas_hash) > 8
+        webgl_valid  = webgl_hash  and len(webgl_hash)  > 8
+        if canvas_valid and webgl_valid:
+            cur = await db.execute(
+                "SELECT user_id FROM verifications "
+                "WHERE canvas_hash = ? AND webgl_hash = ? AND ip_address = ? "
+                "AND user_id != ? LIMIT 1",
+                (canvas_hash, webgl_hash, client_ip, new_user_id),
             )
-            await DataEngine.log_fraud_attempt(
-                new_user_id, "high_ip_usage", client_ip,
-                f"existing_users_on_ip={ip_count}"
-            )
-            if ip_count >= MAX_USERS_PER_IP_BAN:
-                return True, "ip_farm"
+            if await cur.fetchone():
+                soft_flags.append("hardware_match")
 
-    return False, ""
+    if soft_flags:
+        logger.info(
+            f"[SOFT-SIGNAL] uid={new_user_id} flags={'+'.join(soft_flags)} "
+            f"— NOT banned, informational only"
+        )
+
+    return False, "", 0
 
 
 def extract_real_ip(request: Request) -> str:
@@ -662,7 +675,7 @@ class AdminConsoleWorkflow(StatesGroup):
     pardon_individual_std    = State()
     write_reject_reason      = State()
 
-bot         = Bot(token=BOT_TOKEN, default=None)
+bot         = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp          = Dispatcher(storage=MemoryStorage())
 core_router = Router()
 
@@ -677,14 +690,18 @@ async def inspect_compulsory_memberships(user_id: int) -> list:
             continue
         try:
             m = await bot.get_chat_member(chat_id=ch["channel_id"], user_id=user_id)
-            if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, ChatMemberStatus.RESTRICTED):
+            if m.status in (
+                ChatMemberStatus.LEFT,
+                ChatMemberStatus.KICKED,
+                ChatMemberStatus.RESTRICTED
+            ):
                 unjoined.append(dict(ch))
         except Exception:
             unjoined.append(dict(ch))
     return unjoined
 
 async def enforce_membership_gate(event, user_id: int) -> bool:
-    unjoined = await inspect_compulsory_memberships(user_id)
+    unjoined     = await inspect_compulsory_memberships(user_id)
     is_callback  = isinstance(event, CallbackQuery)
     current_data = event.data if is_callback else ""
 
@@ -694,19 +711,22 @@ async def enforce_membership_gate(event, user_id: int) -> bool:
             all_channels = await DataEngine.get_force_channels()
             for ch in all_channels:
                 if ch["bot_added"] == 1:
-                    if not any(x['channel_id'] == ch['channel_id'] for x in unjoined):
+                    if not any(x["channel_id"] == ch["channel_id"] for x in unjoined):
                         unjoined.append(dict(ch))
 
     if not unjoined:
         return True
 
-    if any(x.get('bot_added') == 1 for x in unjoined):
+    if any(x.get("bot_added") == 1 for x in unjoined):
         await DataEngine.mark_fake_join_seen(user_id)
 
-    buttons = []
-    for ch in unjoined:
-        buttons.append([InlineKeyboardButton(text=f"➕ Join: {ch['channel_name']}", url=ch["invite_link"])])
-    buttons.append([InlineKeyboardButton(text="✅ Joined / ተቀላቅያለሁ", callback_data="ui_revalidate_channels")])
+    buttons = [
+        [InlineKeyboardButton(text=f"➕ Join: {ch['channel_name']}", url=ch["invite_link"])]
+        for ch in unjoined
+    ]
+    buttons.append([
+        InlineKeyboardButton(text="✅ Joined / ተቀላቅያለሁ", callback_data="ui_revalidate_channels")
+    ])
 
     txt = (
         "👋 <b>Welcome!</b>\n\n"
@@ -730,13 +750,19 @@ async def process_channel_revalidation(callback: CallbackQuery, state: FSMContex
         if ch["bot_added"] == 0:
             try:
                 m = await bot.get_chat_member(chat_id=ch["channel_id"], user_id=uid)
-                if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, ChatMemberStatus.RESTRICTED):
+                if m.status in (
+                    ChatMemberStatus.LEFT,
+                    ChatMemberStatus.KICKED,
+                    ChatMemberStatus.RESTRICTED
+                ):
                     real_unjoined.append(ch)
             except Exception:
                 real_unjoined.append(ch)
 
     if real_unjoined:
-        return await callback.answer("❌ Please join all channels and continue.", show_alert=True)
+        return await callback.answer(
+            "❌ Please join all channels and continue.", show_alert=True
+        )
 
     try:
         await callback.message.delete()
@@ -748,13 +774,17 @@ async def process_channel_revalidation(callback: CallbackQuery, state: FSMContex
     await state.clear()
 
     if await DataEngine.is_verified(uid):
-        await callback.message.answer("✅ Identity clear!", reply_markup=generate_dashboard_matrix(uid))
+        await callback.message.answer(
+            "✅ Identity clear!", reply_markup=generate_dashboard_matrix(uid)
+        )
     else:
         sent = await callback.message.answer(
             f"{BOT_RULES_CAPTION}\n\n🔐 <b>Attestation Step:</b> Launch Mini App verification:",
             reply_markup=generate_verification_widget(uid, ref, 0)
         )
-        await sent.edit_reply_markup(reply_markup=generate_verification_widget(uid, ref, sent.message_id))
+        await sent.edit_reply_markup(
+            reply_markup=generate_verification_widget(uid, ref, sent.message_id)
+        )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CORE BOT HANDLERS
@@ -777,13 +807,18 @@ async def process_start_command(message: Message, state: FSMContext):
         return
 
     if await DataEngine.is_verified(uid):
-        return await message.answer("✅ <b>Welcome back!</b> Access granted.", reply_markup=generate_dashboard_matrix(uid))
+        return await message.answer(
+            "✅ <b>Welcome back!</b> Access granted.",
+            reply_markup=generate_dashboard_matrix(uid)
+        )
 
     sent = await message.answer(
         f"{BOT_RULES_CAPTION}\n\n🔐 <b>Next Step:</b> Verify identity via Mini App:",
         reply_markup=generate_verification_widget(uid, ref, 0)
     )
-    await sent.edit_reply_markup(reply_markup=generate_verification_widget(uid, ref, sent.message_id))
+    await sent.edit_reply_markup(
+        reply_markup=generate_verification_widget(uid, ref, sent.message_id)
+    )
 
 @core_router.callback_query(F.data == "ui_return_home")
 async def process_navigation_home(callback: CallbackQuery, state: FSMContext):
@@ -812,11 +847,11 @@ async def process_balance_query(callback: CallbackQuery):
 async def process_referral_query(callback: CallbackQuery):
     if not await enforce_membership_gate(callback, callback.from_user.id):
         return
-    uid          = callback.from_user.id
-    direct, _    = await DataEngine.get_referral_metrics(uid)
-    rate         = float(await DataEngine.get_setting("reward_per_referral", "10"))
-    me           = await bot.get_me()
-    link         = f"https://t.me/{me.username}?start={uid}"
+    uid       = callback.from_user.id
+    direct, _ = await DataEngine.get_referral_metrics(uid)
+    rate      = float(await DataEngine.get_setting("reward_per_referral", "10"))
+    me        = await bot.get_me()
+    link      = f"https://t.me/{me.username}?start={uid}"
     await callback.message.edit_text(
         f"👥 <b>Your Referral Network:</b>\n\n"
         f"• Total Referrals: <b>{direct} users</b>\n"
@@ -855,11 +890,11 @@ def evaluate_admin_access(user_id: int) -> bool:
 
 def parse_telegram_webapp_handshake(init_data: str) -> dict | None:
     try:
-        parsed = dict(urllib.parse.parse_qsl(init_data, strict_parsing=True))
-        vh     = parsed.pop("hash", "")
+        parsed    = dict(urllib.parse.parse_qsl(init_data, strict_parsing=True))
+        vh        = parsed.pop("hash", "")
         check_str = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
-        key    = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-        sig    = hmac.new(key, check_str.encode(), hashlib.sha256).hexdigest()
+        key       = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        sig       = hmac.new(key, check_str.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, vh):
             return None
         return json.loads(parsed.get("user", "{}"))
@@ -867,23 +902,23 @@ def parse_telegram_webapp_handshake(init_data: str) -> dict | None:
         return None
 
 async def execute_network_vpn_lookup(client_ip: str) -> bool:
-    """
-    VPN CHECK — v3 FIX:
-    type = "VPN" ወይም "TOR" ብቻ ሲሆን True ይመልሳል።
-    operator field check ሙሉ በሙሉ ተወግዷል።
-    """
-    if not client_ip or client_ip in ("127.0.0.1", "::1", "unknown"):
+    if not _is_real_ip(client_ip):
         return False
     try:
         param = f"&key={PROXYCHECK_API_KEY}" if PROXYCHECK_API_KEY else ""
-        url = f"https://proxycheck.io/v2/{client_ip}?vpn=1&asn=1{param}"
+        url   = f"https://proxycheck.io/v2/{client_ip}?vpn=1&asn=1{param}"
         async with httpx.AsyncClient(timeout=5) as c:
-            r = await c.get(url)
+            r       = await c.get(url)
             payload = r.json()
-            d = payload.get(client_ip, {})
-            ptype = (d.get("type") or "").upper()
-            logger.info(f"proxycheck result ip={client_ip} type={ptype}")
-            return ptype in ("VPN", "TOR")
+            d       = payload.get(client_ip, {})
+            ptype   = (d.get("type") or "").upper()
+            operator = d.get("operator")
+            logger.info(f"proxycheck ip={client_ip} result={d}")
+            if ptype in ("VPN", "TOR"):
+                return True
+            if operator and isinstance(operator, dict) and operator.get("name"):
+                return True
+            return False
     except Exception:
         logger.warning(f"proxycheck lookup failed for ip={client_ip}")
         return False
@@ -897,46 +932,47 @@ def generate_verification_widget(user_id: int, ref: int, msg_id: int = 0):
 def generate_dashboard_matrix(user_id: int) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton(text="💰 Balance / ሒሳብ",    callback_data="ui_fetch_balance"),
-            InlineKeyboardButton(text="👥 Referrals / ጋባዦች", callback_data="ui_fetch_referrals"),
+            InlineKeyboardButton(text="💰 Balance / ሒሳብ",     callback_data="ui_fetch_balance"),
+            InlineKeyboardButton(text="👥 Referrals / ጋባዦች",  callback_data="ui_fetch_referrals"),
         ],
         [
-            InlineKeyboardButton(text="🔗 My Link / ሊንኬ",       callback_data="ui_fetch_link"),
+            InlineKeyboardButton(text="🔗 My Link / ሊንኬ",      callback_data="ui_fetch_link"),
             InlineKeyboardButton(text="💸 Withdraw / ብር ማውጫ", callback_data="ui_initiate_withdrawal"),
         ],
     ]
     if evaluate_admin_access(user_id):
-        rows.append([InlineKeyboardButton(text="⚙️ Admin Control Center", callback_data="ui_admin_core")])
+        rows.append([
+            InlineKeyboardButton(text="⚙️ Admin Control Center", callback_data="ui_admin_core")
+        ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def generate_admin_dashboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="💎 Set Referral Reward",  callback_data="adm_cmd_reward"),
-            InlineKeyboardButton(text="💵 Set Min Withdrawal",   callback_data="adm_cmd_min_wd"),
+            InlineKeyboardButton(text="💎 Set Referral Reward", callback_data="adm_cmd_reward"),
+            InlineKeyboardButton(text="💵 Set Min Withdrawal",  callback_data="adm_cmd_min_wd"),
         ],
         [
-            InlineKeyboardButton(text="✍️ Edit User Balance",    callback_data="adm_cmd_edit_bal"),
-            InlineKeyboardButton(text="📊 Bot Statistics",       callback_data="adm_cmd_stats"),
+            InlineKeyboardButton(text="✍️ Edit User Balance",   callback_data="adm_cmd_edit_bal"),
+            InlineKeyboardButton(text="📊 Bot Statistics",      callback_data="adm_cmd_stats"),
         ],
         [
             InlineKeyboardButton(text="🔴 Force Join (Real Admin)", callback_data="adm_cmd_add_mand"),
             InlineKeyboardButton(text="🟡 Fake Join (No Admin)",    callback_data="adm_cmd_add_noadmin"),
         ],
-        [InlineKeyboardButton(text="🗑 Remove Force Channel",   callback_data="adm_cmd_rm_node")],
-        [InlineKeyboardButton(text="📋 List Force Channels",    callback_data="adm_cmd_list_channels")],
+        [InlineKeyboardButton(text="🗑 Remove Force Channel",  callback_data="adm_cmd_rm_node")],
+        [InlineKeyboardButton(text="📋 List Force Channels",   callback_data="adm_cmd_list_channels")],
         [
             InlineKeyboardButton(text="📥 Pending Withdrawals", callback_data="adm_cmd_pending_tickets"),
             InlineKeyboardButton(text="📢 Broadcast Message",   callback_data="adm_cmd_broadcast"),
         ],
-        [InlineKeyboardButton(text="🔍 Search User",            callback_data="adm_cmd_search")],
-        [InlineKeyboardButton(text="⚠️ Fraud Log",              callback_data="adm_cmd_fraud_log")],
+        [InlineKeyboardButton(text="🔍 Search User",           callback_data="adm_cmd_search")],
         [
-            InlineKeyboardButton(text="🚫 Ban User",            callback_data="adm_cmd_ban"),
-            InlineKeyboardButton(text="✅ Unban Dashboard",     callback_data="adm_cmd_unban_menu"),
+            InlineKeyboardButton(text="🚫 Ban User",           callback_data="adm_cmd_ban"),
+            InlineKeyboardButton(text="✅ Unban Dashboard",    callback_data="adm_cmd_unban_menu"),
         ],
-        [InlineKeyboardButton(text="🛑 STOP BOT ENGINE",        callback_data="adm_stop_bot_confirm1")],
-        [InlineKeyboardButton(text="🔙 Back to Main Menu",      callback_data="ui_return_home")],
+        [InlineKeyboardButton(text="🛑 STOP BOT ENGINE",       callback_data="adm_stop_bot_confirm1")],
+        [InlineKeyboardButton(text="🔙 Back to Main Menu",     callback_data="ui_return_home")],
     ])
 
 def generate_fallback_navigation(target="ui_return_home") -> InlineKeyboardMarkup:
@@ -951,12 +987,13 @@ def generate_fallback_navigation(target="ui_return_home") -> InlineKeyboardMarku
 async def process_withdrawal_start(callback: CallbackQuery, state: FSMContext):
     if not await enforce_membership_gate(callback, callback.from_user.id):
         return
-    user  = await DataEngine.get_user(callback.from_user.id)
-    min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
+    user        = await DataEngine.get_user(callback.from_user.id)
+    min_w       = float(await DataEngine.get_setting("min_withdrawal", "50"))
     current_bal = round(float(user["balance"]), 2)
     if current_bal < min_w:
         return await callback.answer(
-            f"❌ Minimum payout baseline is {min_w:.2f} Birr. Your balance is {current_bal:.2f} Birr.",
+            f"❌ Minimum payout baseline is {min_w:.2f} Birr. "
+            f"Your balance is {current_bal:.2f} Birr.",
             show_alert=True
         )
     await state.set_state(UserWithdrawalWorkflow.select_payout_gateway)
@@ -969,7 +1006,10 @@ async def process_withdrawal_start(callback: CallbackQuery, state: FSMContext):
         ])
     )
 
-@core_router.callback_query(F.data == "gateway_telebirr", UserWithdrawalWorkflow.select_payout_gateway)
+@core_router.callback_query(
+    F.data == "gateway_telebirr",
+    UserWithdrawalWorkflow.select_payout_gateway
+)
 async def process_telebirr_selection(callback: CallbackQuery, state: FSMContext):
     await state.set_state(UserWithdrawalWorkflow.input_cash_volume)
     await callback.message.edit_text(
@@ -1012,12 +1052,11 @@ async def process_account_title(message: Message, state: FSMContext):
         return await message.answer("❌ Name is too short.")
     await state.update_data(validated_title=title)
     s = await state.get_data()
-    safe_title = sanitize_html(title)
     await message.answer(
         f"⚠️ <b>Review Settlement Details</b>\n\n"
         f"• Platform: <code>Telebirr</code>\n"
         f"• Amount: <code>{s['validated_volume']:.2f} ETB</code>\n"
-        f"• Holder: <code>{safe_title}</code>\n"
+        f"• Holder: <code>{sanitize_html(title)}</code>\n"
         f"• Number: <code>{sanitize_html(s['validated_phone'])}</code>\n\n"
         f"Authorization requested.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -1027,7 +1066,10 @@ async def process_account_title(message: Message, state: FSMContext):
     )
     await state.set_state(UserWithdrawalWorkflow.payout_final_approval)
 
-@core_router.callback_query(F.data == "action_payout_dispatch", UserWithdrawalWorkflow.payout_final_approval)
+@core_router.callback_query(
+    F.data == "action_payout_dispatch",
+    UserWithdrawalWorkflow.payout_final_approval
+)
 async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
     s   = await state.get_data()
     uid = callback.from_user.id
@@ -1043,7 +1085,10 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
     user = await DataEngine.get_user(uid)
     me   = await bot.get_me()
     proof_channel_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}?start={uid}")
+        InlineKeyboardButton(
+            text="🚀 Invite Now",
+            url=f"https://t.me/{me.username}?start={uid}"
+        )
     ]])
 
     post_id = 0
@@ -1061,14 +1106,16 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
                 f"⏰ <b>Timestamp:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━"
             )
-            receipt = await bot.send_message(PAYMENT_LOG_CHANNEL, txt, reply_markup=proof_channel_keyboard)
+            receipt = await bot.send_message(
+                PAYMENT_LOG_CHANNEL, txt, reply_markup=proof_channel_keyboard
+            )
             post_id = receipt.message_id
             await DataEngine.update_withdrawal_status(tid, "pending", post_id)
         except Exception as e:
             logger.error(f"Log Channel Post Error: {e}")
 
     direct_ref, tier2_ref = await DataEngine.get_referral_metrics(uid)
-    alias_str  = f"@{sanitize_html(user['username'])}" if user["username"] else "None"
+    alias_str = f"@{sanitize_html(user['username'])}" if user["username"] else "None"
     admin_txt = (
         f"📥 <b>Incoming Ticket #{tid}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1084,10 +1131,16 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
     )
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Approve (ይለቀቅ)",  callback_data=f"adm_payout_ap_{tid}"),
-            InlineKeyboardButton(text="❌ Deny (ውድቅ አድርግ)", callback_data=f"adm_payout_rjmenu_{tid}"),
+            InlineKeyboardButton(
+                text="✅ Approve (ይለቀቅ)",  callback_data=f"adm_payout_ap_{tid}"
+            ),
+            InlineKeyboardButton(
+                text="❌ Deny (ውድቅ አድርግ)", callback_data=f"adm_payout_rjmenu_{tid}"
+            ),
         ],
-        [InlineKeyboardButton(text="👥 View Referrals", callback_data=f"adm_view_invites_{uid}")]
+        [InlineKeyboardButton(
+            text="👥 View Referrals", callback_data=f"adm_view_invites_{uid}"
+        )]
     ])
     for aid in ADMIN_IDS:
         try:
@@ -1110,12 +1163,15 @@ async def process_admin_view_invites(callback: CallbackQuery):
     target_uid    = int(callback.data.split("_")[3])
     invited_nodes = await DataEngine.get_all_invited_users(target_uid)
     if not invited_nodes:
-        return await callback.answer("📭 This user has not invited anyone yet.", show_alert=True)
+        return await callback.answer(
+            "📭 This user has not invited anyone yet.", show_alert=True
+        )
     lines = []
     for idx, node in enumerate(invited_nodes, 1):
-        uname = f"@{node['username']}" if node['username'] else "No Username"
+        uname = f"@{node['username']}" if node["username"] else "No Username"
         lines.append(
-            f"{idx}. {sanitize_html(node['full_name'])} ({sanitize_html(uname)}) — ID: <code>{node['user_id']}</code>\n"
+            f"{idx}. {sanitize_html(node['full_name'])} ({sanitize_html(uname)}) "
+            f"— ID: <code>{node['user_id']}</code>\n"
             f"📅 Joined: {node['joined_at']}"
         )
     chunk_txt = f"👥 <b>Invited Users for ID {target_uid}:</b>\n\n" + "\n\n".join(lines)
@@ -1127,36 +1183,6 @@ async def process_admin_view_invites(callback: CallbackQuery):
         reply_markup=generate_fallback_navigation("ui_admin_core")
     )
     await callback.answer()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ADMIN — FRAUD LOG
-# ─────────────────────────────────────────────────────────────────────────────
-@core_router.callback_query(F.data == "adm_cmd_fraud_log")
-async def process_fraud_log(callback: CallbackQuery):
-    if not evaluate_admin_access(callback.from_user.id):
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM fraud_log ORDER BY logged_at DESC LIMIT 20"
-        )
-        rows = await cur.fetchall()
-    if not rows:
-        return await callback.message.edit_text(
-            "📭 No fraud attempts logged.", reply_markup=generate_fallback_navigation("ui_admin_core")
-        )
-    lines = []
-    for r in rows:
-        lines.append(
-            f"⚠️ <code>{r['reason']}</code>\n"
-            f"   uid=<code>{r['user_id']}</code> ip=<code>{r['ip_address']}</code>\n"
-            f"   {r['details']}\n"
-            f"   🕐 {r['logged_at']}"
-        )
-    await callback.message.edit_text(
-        f"⚠️ <b>Fraud Log (last 20):</b>\n\n" + "\n\n".join(lines),
-        reply_markup=generate_fallback_navigation("ui_admin_core")
-    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ADMIN — APPROVE WITHDRAWAL
@@ -1172,7 +1198,10 @@ async def process_admin_approval(callback: CallbackQuery):
     await DataEngine.update_withdrawal_status(tid, "approved", ticket["channel_post_id"])
     me = await bot.get_me()
     proof_channel_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}?start={ticket['user_id']}")
+        InlineKeyboardButton(
+            text="🚀 Invite Now",
+            url=f"https://t.me/{me.username}?start={ticket['user_id']}"
+        )
     ]])
     if PAYMENT_LOG_CHANNEL and ticket["channel_post_id"]:
         txt = (
@@ -1206,7 +1235,8 @@ async def process_admin_approval(callback: CallbackQuery):
     try:
         await bot.send_message(
             ticket["user_id"],
-            f"🎉 Your cashout of {ticket['amount']:.2f} Birr has been approved and sent via Telebirr!"
+            f"🎉 Your cashout of {ticket['amount']:.2f} Birr has been "
+            f"approved and sent via Telebirr!"
         )
     except Exception:
         pass
@@ -1221,13 +1251,27 @@ async def process_admin_rejection_menu(callback: CallbackQuery):
         return
     tid = int(callback.data.split("_")[3])
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🤖 Multi-bot / Clone Account",      callback_data=f"rj_select_{tid}_multi_bot")],
-        [InlineKeyboardButton(text="❌ Fake Activity / Emulators",       callback_data=f"rj_select_{tid}_fake_activity")],
-        [InlineKeyboardButton(text="👥 No Organic Invites",              callback_data=f"rj_select_{tid}_no_invites")],
-        [InlineKeyboardButton(text="✍️ Write Custom Reason",             callback_data=f"rj_select_{tid}_write_custom")],
-        [InlineKeyboardButton(text="🔙 Cancel",                          callback_data="ui_admin_core")],
+        [InlineKeyboardButton(
+            text="🤖 Multi-bot / Clone Account",
+            callback_data=f"rj_select_{tid}_multi_bot"
+        )],
+        [InlineKeyboardButton(
+            text="❌ Fake Activity / Emulators",
+            callback_data=f"rj_select_{tid}_fake_activity"
+        )],
+        [InlineKeyboardButton(
+            text="👥 No Organic Invites",
+            callback_data=f"rj_select_{tid}_no_invites"
+        )],
+        [InlineKeyboardButton(
+            text="✍️ Write Custom Reason",
+            callback_data=f"rj_select_{tid}_write_custom"
+        )],
+        [InlineKeyboardButton(text="🔙 Cancel", callback_data="ui_admin_core")],
     ])
-    await callback.message.edit_text("❌ <b>Select Rejection Reason:</b>", reply_markup=markup)
+    await callback.message.edit_text(
+        "❌ <b>Select Rejection Reason:</b>", reply_markup=markup
+    )
 
 @core_router.callback_query(F.data.startswith("rj_select_"))
 async def process_reason_selection(callback: CallbackQuery, state: FSMContext):
@@ -1242,7 +1286,9 @@ async def process_reason_selection(callback: CallbackQuery, state: FSMContext):
     if choice == "write_custom":
         await state.set_state(AdminConsoleWorkflow.write_reject_reason)
         await state.update_data(active_reject_tid=tid)
-        return await callback.message.edit_text("✍️ <b>Write the rejection reason to send to user:</b>")
+        return await callback.message.edit_text(
+            "✍️ <b>Write the rejection reason to send to user:</b>"
+        )
     reason_map = {
         "multi_bot":     "Multi-account / Clone system detected.",
         "fake_activity": "Fake verification / Fraudulent activity detected.",
@@ -1262,7 +1308,9 @@ async def process_custom_written_reason(message: Message, state: FSMContext):
     await execute_withdrawal_rejection(message, tid, ticket, message.text.strip())
 
 async def execute_withdrawal_rejection(msg_obj, tid, ticket, reason):
-    await DataEngine.update_withdrawal_status(tid, "rejected", ticket["channel_post_id"], reason)
+    await DataEngine.update_withdrawal_status(
+        tid, "rejected", ticket["channel_post_id"], reason
+    )
     warning_notice = (
         f"❌ <b>Your Withdrawal Request has been Rejected!</b>\n\n"
         f"💰 <b>Amount:</b> <code>{ticket['amount']:.2f} Birr</code>\n"
@@ -1289,14 +1337,18 @@ async def execute_withdrawal_rejection(msg_obj, tid, ticket, reason):
 @core_router.callback_query(F.data == "ui_admin_core")
 async def process_admin_panel(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
-    await callback.message.edit_text("⚙️ <b>Operational Admin Master Engine</b>", reply_markup=generate_admin_dashboard())
+    await callback.message.edit_text(
+        "⚙️ <b>Operational Admin Master Engine</b>",
+        reply_markup=generate_admin_dashboard()
+    )
 
 @core_router.callback_query(F.data == "adm_cmd_add_mand")
 async def process_add_channel_start(callback: CallbackQuery, state: FSMContext):
     if not evaluate_admin_access(callback.from_user.id): return
     await state.set_state(AdminConsoleWorkflow.append_mandatory_id)
     await callback.message.edit_text(
-        "🔴 <b>Force Join — Real Check</b>\nEnter Channel ID (e.g. <code>-1001234567890</code>):",
+        "🔴 <b>Force Join — Real Check</b>\n"
+        "Enter Channel ID (e.g. <code>-1001234567890</code>):",
         reply_markup=generate_fallback_navigation("ui_admin_core")
     )
 
@@ -1316,8 +1368,13 @@ async def process_add_channel_title(message: Message, state: FSMContext):
 async def process_add_channel_finalize(message: Message, state: FSMContext):
     s = await state.get_data()
     await state.clear()
-    await DataEngine.add_force_channel(s["ch_id"], s["ch_title"], message.text.strip(), bot_added=0)
-    await message.answer(f"✅ <b>Force channel added!</b>\n📌 {sanitize_html(s['ch_title'])}", reply_markup=generate_admin_dashboard())
+    await DataEngine.add_force_channel(
+        s["ch_id"], s["ch_title"], message.text.strip(), bot_added=0
+    )
+    await message.answer(
+        f"✅ <b>Force channel added!</b>\n📌 {sanitize_html(s['ch_title'])}",
+        reply_markup=generate_admin_dashboard()
+    )
 
 @core_router.callback_query(F.data == "adm_cmd_add_noadmin")
 async def process_add_noadmin_start(callback: CallbackQuery, state: FSMContext):
@@ -1340,20 +1397,31 @@ async def process_noadmin_title(message: Message, state: FSMContext):
     await state.clear()
     fake_key = "fake_" + hashlib.md5(s["na_link"].encode()).hexdigest()[:8]
     await DataEngine.add_force_channel(
-        channel_id=fake_key, channel_name=message.text.strip(), invite_link=s["na_link"], bot_added=1
+        channel_id=fake_key,
+        channel_name=message.text.strip(),
+        invite_link=s["na_link"],
+        bot_added=1
     )
-    await message.answer(f"✅ <b>Fake ቻናል ተጨምሯል!</b>\n📌 {sanitize_html(message.text.strip())}", reply_markup=generate_admin_dashboard())
+    await message.answer(
+        f"✅ <b>Fake ቻናል ተጨምሯል!</b>\n📌 {sanitize_html(message.text.strip())}",
+        reply_markup=generate_admin_dashboard()
+    )
 
 @core_router.callback_query(F.data == "adm_cmd_list_channels")
 async def process_list_channels(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
     channels = await DataEngine.get_force_channels()
     if not channels:
-        return await callback.message.edit_text("📭 No channels.", reply_markup=generate_fallback_navigation("ui_admin_core"))
+        return await callback.message.edit_text(
+            "📭 No channels.",
+            reply_markup=generate_fallback_navigation("ui_admin_core")
+        )
     lines = []
     for ch in channels:
         mode = "🟡 Fake" if ch["bot_added"] else "🔴 Real"
-        lines.append(f"{mode} — <b>{sanitize_html(ch['channel_name'])}</b>\n🔗 {ch['invite_link']}")
+        lines.append(
+            f"{mode} — <b>{sanitize_html(ch['channel_name'])}</b>\n🔗 {ch['invite_link']}"
+        )
     await callback.message.edit_text(
         f"📋 <b>Force Channels ({len(channels)})</b>\n\n" + "\n\n".join(lines),
         reply_markup=generate_fallback_navigation("ui_admin_core")
@@ -1364,13 +1432,22 @@ async def process_rm_channel_menu(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
     channels = await DataEngine.get_force_channels()
     if not channels:
-        return await callback.message.edit_text("📭 No channels.", reply_markup=generate_fallback_navigation("ui_admin_core"))
+        return await callback.message.edit_text(
+            "📭 No channels.",
+            reply_markup=generate_fallback_navigation("ui_admin_core")
+        )
     buttons = []
     for ch in channels:
         mode = "🟡" if ch["bot_added"] else "🔴"
-        buttons.append([InlineKeyboardButton(text=f"🗑 {mode} {sanitize_html(ch['channel_name'])}", callback_data=f"execute_rm_node_{ch['id']}")])
+        buttons.append([InlineKeyboardButton(
+            text=f"🗑 {mode} {sanitize_html(ch['channel_name'])}",
+            callback_data=f"execute_rm_node_{ch['id']}"
+        )])
     buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data="ui_admin_core")])
-    await callback.message.edit_text("<b>Select channel to remove:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.edit_text(
+        "<b>Select channel to remove:</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
 
 @core_router.callback_query(F.data.startswith("execute_rm_node_"))
 async def process_rm_channel_action(callback: CallbackQuery):
@@ -1385,10 +1462,16 @@ async def process_rm_channel_action(callback: CallbackQuery):
 async def stop_bot_first_confirmation(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚠️ ኃላፊነቱን እወስዳለሁ - ቀጥል", callback_data="adm_stop_bot_confirm2")],
-        [InlineKeyboardButton(text="❌ አቁም/ተመለስ",               callback_data="ui_admin_core")],
+        [InlineKeyboardButton(
+            text="⚠️ ኃላፊነቱን እወስዳለሁ - ቀጥል",
+            callback_data="adm_stop_bot_confirm2"
+        )],
+        [InlineKeyboardButton(text="❌ አቁም/ተመለስ", callback_data="ui_admin_core")],
     ])
-    await callback.message.edit_text("🚨 <b>FIRST WARNING!</b>\n\nቦቱን ማቆም ከፈለጉ እርግጠኛ ነዎት?", reply_markup=markup)
+    await callback.message.edit_text(
+        "🚨 <b>FIRST WARNING!</b>\n\nቦቱን ማቆም ከፈለጉ እርግጠኛ ነዎት?",
+        reply_markup=markup
+    )
 
 @core_router.callback_query(F.data == "adm_stop_bot_confirm2")
 async def stop_bot_final_confirmation(callback: CallbackQuery):
@@ -1402,14 +1485,19 @@ async def stop_bot_final_confirmation(callback: CallbackQuery):
 @core_router.callback_query(F.data == "adm_stop_bot_execute")
 async def execute_bot_shutdown(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
-    await callback.message.edit_text("🛑 <b>Bot polling stopped. Mini App is still running.</b>")
+    await callback.message.edit_text(
+        "🛑 <b>Bot polling stopped. Mini App is still running.</b>"
+    )
     await dp.stop_polling()
 
 @core_router.callback_query(F.data == "adm_cmd_edit_bal")
 async def process_edit_balance_start(callback: CallbackQuery, state: FSMContext):
     if not evaluate_admin_access(callback.from_user.id): return
     await state.set_state(AdminConsoleWorkflow.direct_balance_target_id)
-    await callback.message.edit_text("<b>Enter Targeted Telegram User ID:</b>", reply_markup=generate_fallback_navigation("ui_admin_core"))
+    await callback.message.edit_text(
+        "<b>Enter Targeted Telegram User ID:</b>",
+        reply_markup=generate_fallback_navigation("ui_admin_core")
+    )
 
 @core_router.message(AdminConsoleWorkflow.direct_balance_target_id)
 async def process_edit_balance_id(message: Message, state: FSMContext):
@@ -1428,18 +1516,15 @@ async def process_edit_balance_final(message: Message, state: FSMContext):
 async def process_stats(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
     async with aiosqlite.connect(DB_PATH) as db:
-        cur  = await db.execute("SELECT COUNT(*), SUM(balance) FROM users")
-        row  = await cur.fetchone()
-        cur2 = await db.execute("SELECT COUNT(*) FROM banned_ips")
+        cur      = await db.execute("SELECT COUNT(*), SUM(balance) FROM users")
+        row      = await cur.fetchone()
+        cur2     = await db.execute("SELECT COUNT(*) FROM banned_ips")
         ip_count = (await cur2.fetchone())[0] or 0
-        cur3 = await db.execute("SELECT COUNT(*) FROM fraud_log")
-        fraud_count = (await cur3.fetchone())[0] or 0
     await callback.message.edit_text(
         f"📊 <b>Bot Analytics:</b>\n\n"
         f"• Registered Users: <b>{row[0] or 0}</b>\n"
         f"• Outstanding Liabilities: <b>{float(row[1] or 0.0):.2f} ETB</b>\n"
-        f"• Banned IPs: <b>{ip_count}</b>\n"
-        f"• Fraud Log Entries: <b>{fraud_count}</b>",
+        f"• Banned IPs: <b>{ip_count}</b>",
         reply_markup=generate_fallback_navigation("ui_admin_core")
     )
 
@@ -1447,7 +1532,10 @@ async def process_stats(callback: CallbackQuery):
 async def process_search_start(callback: CallbackQuery, state: FSMContext):
     if not evaluate_admin_access(callback.from_user.id): return
     await state.set_state(AdminConsoleWorkflow.lookup_individual_id)
-    await callback.message.edit_text("🔍 <b>Enter Target User Telegram ID:</b>", reply_markup=generate_fallback_navigation("ui_admin_core"))
+    await callback.message.edit_text(
+        "🔍 <b>Enter Target User Telegram ID:</b>",
+        reply_markup=generate_fallback_navigation("ui_admin_core")
+    )
 
 @core_router.message(AdminConsoleWorkflow.lookup_individual_id)
 async def process_search_execute(message: Message, state: FSMContext):
@@ -1461,27 +1549,13 @@ async def process_search_execute(message: Message, state: FSMContext):
         return await message.answer("❌ User not found.", reply_markup=generate_admin_dashboard())
     direct, tier2 = await DataEngine.get_referral_metrics(target)
     verif    = await DataEngine.get_verification(target)
-    ip_info  = f"<code>{verif['ip_address']}</code>"  if verif else "Not verified"
-    ref_ip   = f"<code>{verif['referrer_ip']}</code>" if (verif and verif['referrer_ip']) else "N/A"
-    tg_plat  = (verif['tg_platform']    or "N/A") if verif else "N/A"
-    tg_ver   = (verif['tg_version']     or "N/A") if verif else "N/A"
-    tg_app   = (verif['tg_app_version'] or "N/A") if verif else "N/A"
-    canvas   = (verif['canvas_hash'][:16] + "…" if verif and verif.get('canvas_hash') else "N/A")
-    webgl    = (verif['webgl_hash'][:16]  + "…" if verif and verif.get('webgl_hash')  else "N/A")
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT reason, logged_at FROM fraud_log WHERE user_id = ? ORDER BY logged_at DESC LIMIT 3",
-            (target,)
-        )
-        fraud_rows = await cur.fetchall()
-    fraud_txt = ""
-    if fraud_rows:
-        fraud_txt = "\n⚠️ <b>Fraud Flags:</b>\n" + "\n".join(
-            f"  • <code>{r['reason']}</code> @ {r['logged_at']}" for r in fraud_rows
-        )
-
+    ip_info  = f"<code>{verif['ip_address']}</code>" if verif else "Not verified"
+    ref_ip   = f"<code>{verif['referrer_ip']}</code>" if (verif and verif["referrer_ip"]) else "N/A"
+    tg_plat  = (verif["tg_platform"]    or "N/A") if verif else "N/A"
+    tg_ver   = (verif["tg_version"]     or "N/A") if verif else "N/A"
+    tg_app   = (verif["tg_app_version"] or "N/A") if verif else "N/A"
+    canvas   = (verif["canvas_hash"][:16] + "…" if verif and verif.get("canvas_hash") else "N/A")
+    webgl    = (verif["webgl_hash"][:16]  + "…" if verif and verif.get("webgl_hash")  else "N/A")
     await message.answer(
         f"👤 <b>User Profile:</b>\n\n"
         f"• Name: {sanitize_html(user['full_name'])}\n"
@@ -1497,8 +1571,7 @@ async def process_search_execute(message: Message, state: FSMContext):
         f"• TG App Version: <b>{tg_app}</b>\n"
         f"• Canvas Hash: <code>{canvas}</code>\n"
         f"• WebGL Hash: <code>{webgl}</code>\n"
-        f"• Joined: {user['joined_at']}"
-        f"{fraud_txt}",
+        f"• Joined: {user['joined_at']}",
         reply_markup=generate_admin_dashboard()
     )
 
@@ -1523,13 +1596,19 @@ async def process_ban_execute(message: Message, state: FSMContext):
         await bot.send_message(target, "🚫 <b>Your account has been banned from this bot.</b>")
     except Exception:
         pass
-    await message.answer(f"✅ User <code>{target}</code> has been banned.", reply_markup=generate_admin_dashboard())
+    await message.answer(
+        f"✅ User <code>{target}</code> has been banned.",
+        reply_markup=generate_admin_dashboard()
+    )
 
 @core_router.callback_query(F.data == "adm_cmd_reward")
 async def process_reward_start(callback: CallbackQuery, state: FSMContext):
     if not evaluate_admin_access(callback.from_user.id): return
     await state.set_state(AdminConsoleWorkflow.modify_referral_bounty)
-    await callback.message.edit_text("<b>Enter New Reward Per Referral (Birr):</b>", reply_markup=generate_fallback_navigation("ui_admin_core"))
+    await callback.message.edit_text(
+        "<b>Enter New Reward Per Referral (Birr):</b>",
+        reply_markup=generate_fallback_navigation("ui_admin_core")
+    )
 
 @core_router.message(AdminConsoleWorkflow.modify_referral_bounty)
 async def process_reward_execute(message: Message, state: FSMContext):
@@ -1541,7 +1620,10 @@ async def process_reward_execute(message: Message, state: FSMContext):
 async def process_min_wd_start(callback: CallbackQuery, state: FSMContext):
     if not evaluate_admin_access(callback.from_user.id): return
     await state.set_state(AdminConsoleWorkflow.modify_minimum_cashout)
-    await callback.message.edit_text("<b>Enter New Minimum Cashout Threshold (Birr):</b>", reply_markup=generate_fallback_navigation("ui_admin_core"))
+    await callback.message.edit_text(
+        "<b>Enter New Minimum Cashout Threshold (Birr):</b>",
+        reply_markup=generate_fallback_navigation("ui_admin_core")
+    )
 
 @core_router.message(AdminConsoleWorkflow.modify_minimum_cashout)
 async def process_min_wd_execute(message: Message, state: FSMContext):
@@ -1554,8 +1636,15 @@ async def process_pending_inventory(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
     pending = await DataEngine.get_pending_withdrawals()
     if not pending:
-        return await callback.message.edit_text("📭 No pending withdrawals.", reply_markup=generate_fallback_navigation("ui_admin_core"))
-    lines = [f"• <b>#{t['id']}</b> — {sanitize_html(t['full_name'])} — <code>{float(t['amount']):.2f} ETB</code>" for t in pending]
+        return await callback.message.edit_text(
+            "📭 No pending withdrawals.",
+            reply_markup=generate_fallback_navigation("ui_admin_core")
+        )
+    lines = [
+        f"• <b>#{t['id']}</b> — {sanitize_html(t['full_name'])} — "
+        f"<code>{float(t['amount']):.2f} ETB</code>"
+        for t in pending
+    ]
     await callback.message.edit_text(
         f"📥 <b>Pending Withdrawals ({len(pending)})</b>\n\n" + "\n".join(lines),
         reply_markup=generate_fallback_navigation("ui_admin_core")
@@ -1565,7 +1654,10 @@ async def process_pending_inventory(callback: CallbackQuery):
 async def process_broadcast_start(callback: CallbackQuery, state: FSMContext):
     if not evaluate_admin_access(callback.from_user.id): return
     await state.set_state(AdminConsoleWorkflow.broadcast_intel_payload)
-    await callback.message.edit_text("📢 <b>Enter Broadcast Message:</b>", reply_markup=generate_fallback_navigation("ui_admin_core"))
+    await callback.message.edit_text(
+        "📢 <b>Enter Broadcast Message:</b>",
+        reply_markup=generate_fallback_navigation("ui_admin_core")
+    )
 
 @core_router.message(AdminConsoleWorkflow.broadcast_intel_payload)
 async def process_broadcast_preview(message: Message, state: FSMContext):
@@ -1573,13 +1665,18 @@ async def process_broadcast_preview(message: Message, state: FSMContext):
     await state.update_data(bc_payload=text)
     await state.set_state(AdminConsoleWorkflow.broadcast_confirmation)
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Send Now",  callback_data="bc_action_confirm")],
-        [InlineKeyboardButton(text="✍️ Edit",       callback_data="adm_cmd_broadcast")],
-        [InlineKeyboardButton(text="❌ Cancel",     callback_data="ui_admin_core")],
+        [InlineKeyboardButton(text="🚀 Send Now", callback_data="bc_action_confirm")],
+        [InlineKeyboardButton(text="✍️ Edit",      callback_data="adm_cmd_broadcast")],
+        [InlineKeyboardButton(text="❌ Cancel",    callback_data="ui_admin_core")],
     ])
-    await message.answer(f"📝 <b>Preview:</b>\n\n{text}\n\n⚠️ Send to all users?", reply_markup=markup)
+    await message.answer(
+        f"📝 <b>Preview:</b>\n\n{text}\n\n⚠️ Send to all users?", reply_markup=markup
+    )
 
-@core_router.callback_query(F.data == "bc_action_confirm", AdminConsoleWorkflow.broadcast_confirmation)
+@core_router.callback_query(
+    F.data == "bc_action_confirm",
+    AdminConsoleWorkflow.broadcast_confirmation
+)
 async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
     s    = await state.get_data()
     text = s["bc_payload"]
@@ -1599,7 +1696,7 @@ async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
             err_str = str(e)
             if "RetryAfter" in err_str:
                 try:
-                    wait = int(''.join(filter(str.isdigit, err_str))) + 1
+                    wait = int("".join(filter(str.isdigit, err_str))) + 1
                 except Exception:
                     wait = 30
                 await asyncio.sleep(wait)
@@ -1623,9 +1720,15 @@ async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
 async def process_unban_dashboard(callback: CallbackQuery):
     if not evaluate_admin_access(callback.from_user.id): return
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Standard Unban (Requires MiniApp)", callback_data="unban_trigger_std")],
-        [InlineKeyboardButton(text="🔥 Full Unban (Bypass MiniApp)",       callback_data="unban_trigger_full")],
-        [InlineKeyboardButton(text="🔙 Back",                               callback_data="ui_admin_core")],
+        [InlineKeyboardButton(
+            text="✅ Standard Unban (Requires MiniApp)",
+            callback_data="unban_trigger_std"
+        )],
+        [InlineKeyboardButton(
+            text="🔥 Full Unban (Bypass MiniApp)",
+            callback_data="unban_trigger_full"
+        )],
+        [InlineKeyboardButton(text="🔙 Back", callback_data="ui_admin_core")],
     ])
     await callback.message.edit_text("🔓 <b>Select Unban Method:</b>", reply_markup=markup)
 
@@ -1730,22 +1833,22 @@ async def execute_verification(request: Request):
     raw_msg_id = int(data.get("msgId") or 0)
     msg_id     = raw_msg_id if raw_msg_id > 0 else 0
 
-    tg_platform    = str(data.get("tgPlatform",    "")).strip()[:50]
-    tg_version     = str(data.get("tgVersion",     "")).strip()[:30]
-    tg_app_version = str(data.get("tgAppVersion",  "")).strip()[:30]
-
-    canvas_hash = str(data.get("canvasHash",  "")).strip()[:64]
-    webgl_hash  = str(data.get("webglHash",   "")).strip()[:64]
-    screen_sig  = str(data.get("screenSig",   "")).strip()[:32]
+    tg_platform    = str(data.get("tgPlatform",   "")).strip()[:50]
+    tg_version     = str(data.get("tgVersion",    "")).strip()[:30]
+    tg_app_version = str(data.get("tgAppVersion", "")).strip()[:30]
+    canvas_hash    = str(data.get("canvasHash",   "")).strip()[:64]
+    webgl_hash     = str(data.get("webglHash",    "")).strip()[:64]
+    screen_sig     = str(data.get("screenSig",    "")).strip()[:32]
 
     if await DataEngine.is_verified(uid):
         return JSONResponse({"status": "already_verified"})
 
     fingerprint = data.get("fingerprint", "").strip()
-
     if not fingerprint or fingerprint in ("undefined", "null", ""):
-        logger.warning(f"[NO-FP] uid={uid} ip={client_ip} — soft block")
-        await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
+        await DataEngine.create_user(
+            uid, tg_user.get("username", ""), tg_user.get("first_name", "")
+        )
+        await DataEngine.ban_user(uid, 1)
         return JSONResponse({"status": "blocked", "reason": "no_fingerprint"})
 
     logger.info(
@@ -1755,11 +1858,13 @@ async def execute_verification(request: Request):
     )
 
     if await DataEngine.is_ip_banned(client_ip):
-        await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
+        await DataEngine.create_user(
+            uid, tg_user.get("username", ""), tg_user.get("first_name", "")
+        )
         await DataEngine.ban_user(uid, 1)
         return JSONResponse({"status": "blocked", "reason": "banned_ip"})
 
-    should_ban, ban_reason = await evaluate_clone_risk(
+    should_ban, ban_reason, fraud_score = await evaluate_clone_risk(
         new_user_id=uid,
         referrer_id=ref_id,
         client_ip=client_ip,
@@ -1772,25 +1877,35 @@ async def execute_verification(request: Request):
         screen_sig=screen_sig,
     )
     if should_ban:
-        await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
+        await DataEngine.create_user(
+            uid, tg_user.get("username", ""), tg_user.get("first_name", "")
+        )
         await DataEngine.ban_user(uid, 1)
         await DataEngine.ban_ip(client_ip, f"clone_detect:{ban_reason}")
         if msg_id > 0:
-            try: await bot.delete_message(chat_id=uid, message_id=msg_id)
-            except Exception: pass
-        logger.warning(f"[FRAUD-BAN] uid={uid} reason={ban_reason} ip={client_ip}")
+            try:
+                await bot.delete_message(chat_id=uid, message_id=msg_id)
+            except Exception:
+                pass
+        logger.warning(
+            f"[FRAUD-BAN] uid={uid} reason={ban_reason} "
+            f"score={fraud_score} ip={client_ip}"
+        )
         return JSONResponse({"status": "blocked", "reason": ban_reason})
 
-    # ── VPN check — soft block, no ban ────────────────────────────────────
+    # VPN check — verify ይከለክላል (ban አያደርግም)። ምክንያቱም VPN እየቀያየሩ IP
+    # spoof ለማድረግ ስለሚሞክሩ፣ ይህን account ብቻ ሳይሆን verification attempt-ን
+    # reject ማድረግ ያስፈልጋል። VPN ካጠፉ በኋላ በድጋሚ መሞከር ይችላሉ።
     is_vpn = await execute_network_vpn_lookup(client_ip)
     if is_vpn:
-        logger.info(f"[VPN-BLOCK] uid={uid} ip={client_ip} — soft block")
-        await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""))
+        logger.info(f"[VPN-BLOCKED] uid={uid} ip={client_ip} — retry without VPN")
         return JSONResponse({"status": "blocked", "reason": "vpn"})
 
     if msg_id > 0:
-        try: await bot.delete_message(chat_id=uid, message_id=msg_id)
-        except Exception: pass
+        try:
+            await bot.delete_message(chat_id=uid, message_id=msg_id)
+        except Exception:
+            pass
 
     referrer_ip = ""
     if ref_id and ref_id != uid:
@@ -1798,7 +1913,9 @@ async def execute_verification(request: Request):
         if ref_verif and ref_verif["ip_address"] not in ("", "BYPASS_ADMIN"):
             referrer_ip = ref_verif["ip_address"]
 
-    await DataEngine.create_user(uid, tg_user.get("username", ""), tg_user.get("first_name", ""), ref_id or None)
+    await DataEngine.create_user(
+        uid, tg_user.get("username", ""), tg_user.get("first_name", ""), ref_id or None
+    )
     await DataEngine.save_verification(
         uid, client_ip, data.get("ua", ""), fingerprint,
         referrer_ip=referrer_ip,
@@ -1814,12 +1931,19 @@ async def execute_verification(request: Request):
         bounty = float(await DataEngine.get_setting("reward_per_referral", "10"))
         await DataEngine.add_balance(ref_id, bounty)
         try:
-            await bot.send_message(ref_id, f"🎉 <b>Referral verified!</b> <code>+{bounty:.2f} Birr</code> credited.")
+            await bot.send_message(
+                ref_id,
+                f"🎉 <b>Referral verified!</b> <code>+{bounty:.2f} Birr</code> credited."
+            )
         except Exception:
             pass
 
     try:
-        await bot.send_message(uid, "✅ <b>Verification Confirmed! Access Granted.</b>", reply_markup=generate_dashboard_matrix(uid))
+        await bot.send_message(
+            uid,
+            "✅ <b>Verification Confirmed! Access Granted.</b>",
+            reply_markup=generate_dashboard_matrix(uid)
+        )
     except Exception:
         pass
 
