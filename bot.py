@@ -2185,4 +2185,4 @@ async def execute_verification(request: Request):
             "reason": "ip_cooldown"
         })
 
-    fingerprint = 
+    fingerprint = data.get("fingerprint", "").strip()
