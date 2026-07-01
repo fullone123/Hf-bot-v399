@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Admin Dashboard</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0B0E11;--panel:#13171C;--panel2:#181D23;--line:#1E2530;
+  --text:#EAE5D9;--muted:#7A8090;--gold:#D4A24E;--gold2:#F0C06A;
+  --green:#4EC97A;--red:#E05048;--amber:#E0B25B;
+  --radius:12px;
+}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased;min-height:100vh;padding-bottom:80px;}
+
+/* ── HEADER ── */
+.header{background:rgba(11,14,17,.95);backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--line);padding:14px 16px;
+  display:flex;align-items:center;justify-content:space-between;
+  position:sticky;top:0;z-index:10;}
+.logo{font-family:'Space Grotesk',sans-serif;font-size:15px;font-weight:700;
+  display:flex;align-items:center;gap:8px;}
+.live-dot{width:8px;height:8px;border-radius:50%;background:var(--green);
+  box-shadow:0 0 8px var(--green);animation:pulse 2s ease-in-out infinite;}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.6;transform:scale(1.3)}}
+.refresh-info{font-size:11px;color:var(--muted);}
+
+/* ── STATS ── */
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:14px 14px 0;}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:14px;position:relative;overflow:hidden;}
+.stat::after{content:'';position:absolute;top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,var(--gold),transparent);}
+.stat.red::after{background:linear-gradient(90deg,var(--red),transparent);}
+.stat.green::after{background:linear-gradient(90deg,var(--green),transparent);}
+.stat-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;}
+.stat-val{font-family:'Space Grotesk',sans-serif;font-size:22px;font-weight:700;
+  background:linear-gradient(135deg,var(--gold),var(--gold2));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.stat.red .stat-val{background:linear-gradient(135deg,var(--red),#F07070);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.stat.green .stat-val{background:linear-gradient(135deg,var(--green),#7AE8A4);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+
+/* ── TABS ── */
+.tabs{display:flex;gap:0;margin:14px 14px 0;background:var(--panel);
+  border:1px solid var(--line);border-radius:10px;padding:4px;}
+.tab{flex:1;background:none;border:none;color:var(--muted);font-size:12px;font-weight:600;
+  padding:8px 4px;border-radius:7px;cursor:pointer;font-family:inherit;transition:.2s;}
+.tab.active{background:var(--panel2);color:var(--gold);}
+
+/* ── PANELS ── */
+.panel{display:none;padding:12px 14px;}
+.panel.active{display:block;animation:fadeIn .2s ease;}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+/* ── TOOLBAR ── */
+.toolbar{display:flex;gap:8px;margin-bottom:10px;}
+input[type=text],select{flex:1;background:var(--panel);border:1px solid var(--line);
+  color:var(--text);padding:9px 12px;border-radius:9px;font-size:13px;
+  font-family:inherit;outline:none;min-width:0;}
+input[type=text]:focus,select:focus{border-color:var(--gold);}
+
+/* ── CARDS (mobile-friendly rows) ── */
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:14px;margin-bottom:10px;animation:fadeIn .2s ease;}
+.card-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;}
+.card-row:last-child{margin-bottom:0;}
+.card-label{font-size:11px;color:var(--muted);}
+.card-val{font-size:13px;font-weight:600;}
+.card-val.mono{font-family:'JetBrains Mono',monospace;font-size:12px;}
+.card-val.gold{color:var(--gold);}
+.card-val.muted{color:var(--muted);}
+.card-actions{display:flex;gap:8px;margin-top:12px;}
+
+/* ── BADGES ── */
+.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;
+  border-radius:20px;font-size:11px;font-weight:600;}
+.badge::before{content:'';width:5px;height:5px;border-radius:50%;}
+.badge.pending{background:rgba(224,178,91,.15);color:var(--amber);}
+.badge.pending::before{background:var(--amber);animation:blink 1.4s infinite;}
+.badge.approved{background:rgba(78,201,122,.15);color:var(--green);}
+.badge.approved::before{background:var(--green);}
+.badge.rejected{background:rgba(224,80,72,.15);color:var(--red);}
+.badge.rejected::before{background:var(--red);}
+.badge.active{background:rgba(78,201,122,.15);color:var(--green);}
+.badge.active::before{background:var(--green);}
+.badge.banned{background:rgba(224,80,72,.15);color:var(--red);}
+.badge.banned::before{background:var(--red);}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+
+/* ── BUTTONS ── */
+.btn{border:none;border-radius:9px;padding:9px 16px;font-size:13px;font-weight:600;
+  cursor:pointer;font-family:inherit;transition:.15s;flex:1;}
+.btn:active{transform:scale(.97);}
+.btn-approve{background:rgba(78,201,122,.15);color:var(--green);border:1px solid rgba(78,201,122,.3);}
+.btn-reject{background:rgba(224,80,72,.12);color:var(--red);border:1px solid rgba(224,80,72,.25);}
+.btn-ban{background:rgba(224,80,72,.1);color:var(--red);border:1px solid rgba(224,80,72,.2);}
+.btn-unban{background:rgba(78,201,122,.1);color:var(--green);border:1px solid rgba(78,201,122,.2);}
+.btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--line);}
+
+/* ── EMPTY / LOADING ── */
+.empty{text-align:center;padding:40px 20px;color:var(--muted);font-size:14px;}
+.empty .ico{font-size:32px;margin-bottom:10px;opacity:.4;}
+.loader{display:flex;justify-content:center;padding:30px;}
+.loader span{width:8px;height:8px;border-radius:50%;background:var(--gold);
+  animation:bounce .8s ease-in-out infinite;margin:0 4px;}
+.loader span:nth-child(2){animation-delay:.15s;}
+.loader span:nth-child(3){animation-delay:.3s;}
+@keyframes bounce{0%,100%{transform:translateY(0)}50%{transform:translateY(-10px)}}
+
+/* ── PAGER ── */
+.pager{display:flex;align-items:center;gap:8px;margin-top:10px;justify-content:flex-end;}
+.pager-info{color:var(--muted);font-size:11px;margin-right:auto;}
+
+/* ── MODAL ── */
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.7);backdrop-filter:blur(4px);
+  display:none;align-items:flex-end;justify-content:center;z-index:50;}
+.modal-bg.show{display:flex;}
+.modal{background:var(--panel);border:1px solid var(--line);
+  border-radius:16px 16px 0 0;padding:20px;width:100%;max-width:480px;
+  animation:slideUp .25s ease;}
+@keyframes slideUp{from{transform:translateY(100%)}to{transform:none}}
+.modal h3{font-size:15px;font-family:'Space Grotesk',sans-serif;margin-bottom:12px;}
+.modal textarea{width:100%;background:var(--panel2);border:1px solid var(--line);
+  color:var(--text);border-radius:9px;padding:10px;font-size:13px;
+  font-family:inherit;min-height:70px;resize:none;outline:none;}
+.modal-btns{display:flex;gap:10px;margin-top:14px;}
+
+/* ── ERROR ── */
+.error-screen{display:flex;flex-direction:column;align-items:center;justify-content:center;
+  min-height:100vh;text-align:center;padding:30px;}
+.error-screen .ico{font-size:48px;margin-bottom:16px;}
+.error-screen h2{font-family:'Space Grotesk',sans-serif;margin-bottom:8px;}
+.error-screen p{color:var(--muted);font-size:14px;}
+
+/* ── TOAST ── */
+.toast{position:fixed;bottom:90px;left:50%;transform:translateX(-50%) translateY(20px);
+  background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--gold);
+  border-radius:10px;padding:10px 18px;font-size:13px;white-space:nowrap;
+  opacity:0;transition:.3s cubic-bezier(.34,1.56,.64,1);z-index:100;pointer-events:none;}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+.toast.err{border-left-color:var(--red);}
+</style>
+</head>
+<body>
+
+<!-- Auth check first -->
+<div class="error-screen" id="errScreen" style="display:none">
+  <div class="ico">🚫</div>
+  <h2>Access Denied</h2>
+  <p>This dashboard is for admins only.</p>
+</div>
+
+<div id="app" style="display:none">
+  <div class="header">
+    <div class="logo">
+      <div class="live-dot"></div>
+      Admin Panel
+    </div>
+    <div class="refresh-info" id="refreshInfo">● live</div>
+  </div>
+
+  <div class="stats" id="stats">
+    <div class="stat"><div class="stat-label">Users</div><div class="stat-val" id="sv0">—</div></div>
+    <div class="stat"><div class="stat-label">Liabilities</div><div class="stat-val" id="sv1">—</div></div>
+    <div class="stat green"><div class="stat-label">Pending</div><div class="stat-val" id="sv2">—</div></div>
+    <div class="stat red"><div class="stat-label">Banned</div><div class="stat-val" id="sv3">—</div></div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="withdrawals">💸 Withdraw</button>
+    <button class="tab" data-tab="users">👥 Users</button>
+    <button class="tab" data-tab="fraud">⚠️ Fraud</button>
+  </div>
+
+  <!-- WITHDRAWALS -->
+  <div class="panel active" id="panel-withdrawals">
+    <div class="toolbar">
+      <select id="wdStatus">
+        <option value="pending">Pending</option>
+        <option value="approved">Approved</option>
+        <option value="rejected">Rejected</option>
+        <option value="all">All</option>
+      </select>
+    </div>
+    <div id="wdList"><div class="loader"><span></span><span></span><span></span></div></div>
+  </div>
+
+  <!-- USERS -->
+  <div class="panel" id="panel-users">
+    <div class="toolbar">
+      <input type="text" id="userSearch" placeholder="Search ID / name / username…">
+    </div>
+    <div id="userList"><div class="loader"><span></span><span></span><span></span></div></div>
+    <div class="pager">
+      <span class="pager-info" id="pageInfo"></span>
+      <button class="btn btn-ghost" style="flex:0;padding:8px 14px" id="prevBtn">‹</button>
+      <button class="btn btn-ghost" style="flex:0;padding:8px 14px" id="nextBtn">›</button>
+    </div>
+  </div>
+
+  <!-- FRAUD -->
+  <div class="panel" id="panel-fraud">
+    <div id="fraudList"><div class="loader"><span></span><span></span><span></span></div></div>
+  </div>
+</div>
+
+<!-- Reject Modal -->
+<div class="modal-bg" id="rejectModal">
+  <div class="modal">
+    <h3>❌ Reject Reason</h3>
+    <textarea id="rejectReason">Multi-account / Clone system detected.</textarea>
+    <div class="modal-btns">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-reject" onclick="confirmReject()">Reject & Notify</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const tg = window.Telegram.WebApp;
+tg.ready();
+tg.expand();
+
+const BASE = "__BACKEND_URL__";
+const INIT_DATA = tg.initData;
+
+// ── AUTH ─────────────────────────────────────────────────────────────────
+async function checkAuth(){
+  try{
+    const r = await callApi('/admin-panel/api/stats');
+    if(r.error){ showError(); return false; }
+    return true;
+  }catch(e){
+    showError(); return false;
+  }
+}
+function showError(){
+  document.getElementById('errScreen').style.display='flex';
+  document.getElementById('app').style.display='none';
+}
+
+// ── API ───────────────────────────────────────────────────────────────────
+async function callApi(path, opts={}){
+  const headers = {'Content-Type':'application/json','X-Init-Data': INIT_DATA};
+  const r = await fetch(BASE + path, {headers, ...opts});
+  const j = await r.json();
+  if(!r.ok) throw new Error(j.detail||'Error');
+  return j;
+}
+
+// ── TOAST ─────────────────────────────────────────────────────────────────
+let toastT;
+function toast(msg, err=false){
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show' + (err?' err':'');
+  clearTimeout(toastT);
+  toastT = setTimeout(()=>el.classList.remove('show'), 2600);
+}
+
+// ── COUNTER ANIMATION ─────────────────────────────────────────────────────
+function animCount(el, to, isFloat=false){
+  const from = parseFloat(el.dataset.raw)||0;
+  if(from===to){ el.textContent=isFloat?fmtF(to):to.toLocaleString(); return; }
+  let s; const dur=700;
+  function step(ts){
+    if(!s)s=ts;
+    const p=Math.min((ts-s)/dur,1), e=1-Math.pow(1-p,3), cur=from+(to-from)*e;
+    el.textContent = isFloat?fmtF(cur):Math.round(cur).toLocaleString();
+    if(p<1)requestAnimationFrame(step); else el.dataset.raw=to;
+  }
+  el.dataset.raw=from; requestAnimationFrame(step);
+}
+function fmtF(n){ return Number(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function esc(s){ if(!s)return''; return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+// ── STATS ─────────────────────────────────────────────────────────────────
+async function loadStats(){
+  const s = await callApi('/admin-panel/api/stats');
+  animCount(document.getElementById('sv0'), s.registered_users);
+  animCount(document.getElementById('sv1'), s.outstanding_liabilities, true);
+  animCount(document.getElementById('sv2'), s.pending_withdrawals);
+  animCount(document.getElementById('sv3'), s.banned_users + s.banned_ips);
+}
+
+// ── TABS ──────────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('panel-'+btn.dataset.tab).classList.add('active');
+    if(btn.dataset.tab==='users') loadUsers(0);
+    if(btn.dataset.tab==='fraud') loadFraud();
+  });
+});
+
+// ── WITHDRAWALS ───────────────────────────────────────────────────────────
+async function loadWithdrawals(){
+  const status = document.getElementById('wdStatus').value;
+  const el = document.getElementById('wdList');
+  el.innerHTML = '<div class="loader"><span></span><span></span><span></span></div>';
+  const data = await callApi(`/admin-panel/api/withdrawals?status=${status}&limit=100`);
+  if(!data.withdrawals.length){
+    el.innerHTML='<div class="empty"><div class="ico">✅</div>No withdrawals here.</div>';
+    return;
+  }
+  el.innerHTML = data.withdrawals.map(w=>`
+    <div class="card">
+      <div class="card-row">
+        <span class="card-label">Ticket</span>
+        <span class="card-val mono">#${w.id}</span>
+      </div>
+      <div class="card-row">
+        <span class="card-label">Holder</span>
+        <span class="card-val">${esc(w.full_name)}</span>
+      </div>
+      <div class="card-row">
+        <span class="card-label">User ID</span>
+        <span class="card-val mono muted">${w.user_id}</span>
+      </div>
+      <div class="card-row">
+        <span class="card-label">Amount</span>
+        <span class="card-val gold">${fmtF(w.amount)} ETB</span>
+      </div>
+      <div class="card-row">
+        <span class="card-label">Phone</span>
+        <span class="card-val mono">${esc(w.phone)}</span>
+      </div>
+      <div class="card-row">
+        <span class="card-label">Status</span>
+        <span class="badge ${w.status}">${w.status}</span>
+      </div>
+      <div class="card-row">
+        <span class="card-label">Date</span>
+        <span class="card-val mono muted">${(w.created_at||'').slice(0,16)}</span>
+      </div>
+      ${w.status==='pending'?`
+      <div class="card-actions">
+        <button class="btn btn-approve" onclick="approveWD(${w.id})">✓ Approve</button>
+        <button class="btn btn-reject" onclick="openReject(${w.id})">✕ Reject</button>
+      </div>`:(w.reason?`<div class="card-row"><span class="card-label">Reason</span><span class="card-val muted" style="font-size:12px">${esc(w.reason)}</span></div>`:'')}
+    </div>
+  `).join('');
+}
+document.getElementById('wdStatus').addEventListener('change', loadWithdrawals);
+
+async function approveWD(id){
+  if(!confirm(`Approve #${id}?`)) return;
+  try{
+    await callApi(`/admin-panel/api/withdrawals/${id}/approve`, {method:'POST'});
+    tg.HapticFeedback.notificationOccurred('success');
+    toast('✅ Approved — user notified.');
+    loadWithdrawals(); loadStats();
+  }catch(e){ toast(e.message,true); }
+}
+
+let pendingRejectId=null;
+function openReject(id){ pendingRejectId=id; document.getElementById('rejectModal').classList.add('show'); }
+function closeModal(){ document.getElementById('rejectModal').classList.remove('show'); pendingRejectId=null; }
+async function confirmReject(){
+  const reason = document.getElementById('rejectReason').value.trim();
+  try{
+    await callApi(`/admin-panel/api/withdrawals/${pendingRejectId}/reject`,
+      {method:'POST', body:JSON.stringify({reason})});
+    tg.HapticFeedback.notificationOccurred('warning');
+    toast('❌ Rejected — user notified.');
+    closeModal(); loadWithdrawals(); loadStats();
+  }catch(e){ toast(e.message,true); }
+}
+
+// ── USERS ─────────────────────────────────────────────────────────────────
+const ULIMIT=15;
+let uOffset=0;
+
+async function loadUsers(offset){
+  uOffset=offset;
+  const search = document.getElementById('userSearch').value.trim();
+  const el = document.getElementById('userList');
+  el.innerHTML='<div class="loader"><span></span><span></span><span></span></div>';
+  const data = await callApi(`/admin-panel/api/users?search=${encodeURIComponent(search)}&limit=${ULIMIT}&offset=${offset}`);
+  if(!data.users.length){
+    el.innerHTML='<div class="empty"><div class="ico">🔍</div>No users found.</div>';
+  }else{
+    el.innerHTML = data.users.map(u=>`
+      <div class="card">
+        <div class="card-row">
+          <span class="card-label">ID</span>
+          <span class="card-val mono muted">${u.user_id}</span>
+        </div>
+        <div class="card-row">
+          <span class="card-label">Name</span>
+          <span class="card-val">${esc(u.full_name||'—')}</span>
+        </div>
+        <div class="card-row">
+          <span class="card-label">Username</span>
+          <span class="card-val mono muted">${u.username?'@'+esc(u.username):'—'}</span>
+        </div>
+        <div class="card-row">
+          <span class="card-label">Balance</span>
+          <span class="card-val gold">${fmtF(u.balance)} ETB</span>
+        </div>
+        <div class="card-row">
+          <span class="card-label">Status</span>
+          <span class="badge ${u.is_banned?'banned':'active'}">${u.is_banned?'Banned':'Active'}</span>
+        </div>
+        <div class="card-row">
+          <span class="card-label">Joined</span>
+          <span class="card-val mono muted">${(u.joined_at||'').slice(0,10)}</span>
+        </div>
+        <div class="card-actions">
+          ${u.is_banned
+            ?`<button class="btn btn-unban" onclick="unbanUser(${u.user_id})">✅ Unban</button>`
+            :`<button class="btn btn-ban" onclick="banUser(${u.user_id})">🚫 Ban</button>`
+          }
+        </div>
+      </div>
+    `).join('');
+  }
+  document.getElementById('pageInfo').textContent=
+    `${offset+1}–${offset+data.users.length} / ${data.total}`;
+  document.getElementById('prevBtn').disabled = offset===0;
+  document.getElementById('nextBtn').disabled = offset+ULIMIT>=data.total;
+}
+document.getElementById('prevBtn').addEventListener('click',()=>loadUsers(Math.max(0,uOffset-ULIMIT)));
+document.getElementById('nextBtn').addEventListener('click',()=>loadUsers(uOffset+ULIMIT));
+document.getElementById('userSearch').addEventListener('keydown',e=>{if(e.key==='Enter')loadUsers(0);});
+
+async function banUser(uid){
+  if(!confirm(`Ban user ${uid}?`)) return;
+  try{
+    await callApi(`/admin-panel/api/users/${uid}/ban`,{method:'POST'});
+    tg.HapticFeedback.notificationOccurred('warning');
+    toast(`🚫 User ${uid} banned.`);
+    loadUsers(uOffset); loadStats();
+  }catch(e){ toast(e.message,true); }
+}
+async function unbanUser(uid){
+  try{
+    await callApi(`/admin-panel/api/users/${uid}/unban`,{method:'POST',body:JSON.stringify({mode:'std'})});
+    tg.HapticFeedback.notificationOccurred('success');
+    toast(`✅ User ${uid} unbanned.`);
+    loadUsers(uOffset); loadStats();
+  }catch(e){ toast(e.message,true); }
+}
+
+// ── FRAUD LOG ─────────────────────────────────────────────────────────────
+async function loadFraud(){
+  const el = document.getElementById('fraudList');
+  el.innerHTML='<div class="loader"><span></span><span></span><span></span></div>';
+  const data = await callApi('/admin-panel/api/fraud_log?limit=50');
+  if(!data.entries.length){
+    el.innerHTML='<div class="empty"><div class="ico">✅</div>No fraud entries.</div>';
+    return;
+  }
+  el.innerHTML = data.entries.map(f=>`
+    <div class="card">
+      <div class="card-row">
+        <span class="card-label">Reason</span>
+        <span class="card-val" style="color:var(--amber);font-size:12px">${esc(f.reason)}</span>
+      </div>
+      <div class="card-row">
+        <span class="card-label">User ID</span>
+        <span class="card-val mono muted">${f.user_id}</span>
+      </div>
+      <div class="card-row">
+        <span class="card-label">IP</span>
+        <span class="card-val mono muted">${esc(f.ip_address||'')}</span>
+      </div>
+      <div class="card-row">
+        <span class="card-label">Details</span>
+        <span class="card-val muted" style="font-size:11px;word-break:break-all">${esc(f.details||'')}</span>
+      </div>
+      <div class="card-row">
+        <span class="card-label">Time</span>
+        <span class="card-val mono muted">${(f.logged_at||'').slice(0,16)}</span>
+      </div>
+    </div>
+  `).join('');
+}
+
+// ── AUTO REFRESH ──────────────────────────────────────────────────────────
+let countdown=15;
+setInterval(()=>{
+  countdown--;
+  document.getElementById('refreshInfo').textContent = `● ${countdown}s`;
+  if(countdown<=0){
+    countdown=15;
+    loadStats();
+    const activeTab = document.querySelector('.tab.active')?.dataset?.tab;
+    if(activeTab==='withdrawals') loadWithdrawals();
+  }
+},1000);
+
+// ── INIT ──────────────────────────────────────────────────────────────────
+(async()=>{
+  const ok = await checkAuth();
+  if(!ok) return;
+  document.getElementById('app').style.display='block';
+  tg.setHeaderColor('#0B0E11');
+  tg.setBackgroundColor('#0B0E11');
+  loadStats();
+  loadWithdrawals();
+})();
+</script>
+</body>
+</html>
